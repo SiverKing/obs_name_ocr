@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OBS Name OCR Overlay</title>
+  <style>
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: transparent;
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      background: transparent;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="overlay"></canvas>
+
+  <script>
+    const WS_URL = "ws://127.0.0.1:8765/ws";
+    const DEFAULT_OVERLAY = {
+      stroke_color: "#ff3b30",
+      line_width: 3,
+      show_label: true
+    };
+
+    const canvas = document.getElementById("overlay");
+    const ctx = canvas.getContext("2d");
+    let latestMessage = null;
+    let socket = null;
+    let reconnectTimer = null;
+
+    function resizeCanvas() {
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.max(1, Math.floor(window.innerWidth * dpr));
+      const height = Math.max(1, Math.floor(window.innerHeight * dpr));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      draw(latestMessage);
+    }
+
+    function clear() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    function draw(message) {
+      clear();
+      if (!message || message.type !== "boxes" || !message.width || !message.height) {
+        return;
+      }
+
+      const boxes = Array.isArray(message.boxes) ? message.boxes : [];
+      if (boxes.length === 0) {
+        return;
+      }
+
+      const dpr = window.devicePixelRatio || 1;
+      const overlay = Object.assign({}, DEFAULT_OVERLAY, message.overlay || {});
+      const scaleX = canvas.width / message.width;
+      const scaleY = canvas.height / message.height;
+
+      ctx.save();
+      ctx.strokeStyle = overlay.stroke_color || DEFAULT_OVERLAY.stroke_color;
+      ctx.lineWidth = Math.max(1, Number(overlay.line_width || DEFAULT_OVERLAY.line_width)) * dpr;
+      ctx.lineJoin = "round";
+      ctx.font = `${Math.round(14 * dpr)}px "Microsoft YaHei", "Segoe UI", sans-serif`;
+      ctx.textBaseline = "top";
+
+      for (const box of boxes) {
+        const x = Number(box.x || 0) * scaleX;
+        const y = Number(box.y || 0) * scaleY;
+        const w = Number(box.w || 0) * scaleX;
+        const h = Number(box.h || 0) * scaleY;
+        if (w <= 0 || h <= 0) {
+          continue;
+        }
+
+        ctx.strokeRect(x, y, w, h);
+
+        if (overlay.show_label) {
+          const label = String(box.matched || box.text || "");
+          if (label) {
+            const paddingX = 5 * dpr;
+            const paddingY = 3 * dpr;
+            const metrics = ctx.measureText(label);
+            const labelW = Math.ceil(metrics.width + paddingX * 2);
+            const labelH = Math.ceil(20 * dpr);
+            const labelY = Math.max(0, y - labelH - 2 * dpr);
+
+            ctx.fillStyle = overlay.stroke_color || DEFAULT_OVERLAY.stroke_color;
+            ctx.fillRect(x, labelY, labelW, labelH);
+            ctx.fillStyle = "#ffffff";
+            ctx.fillText(label, x + paddingX, labelY + paddingY);
+          }
+        }
+      }
+
+      ctx.restore();
+    }
+
+    function connect() {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+
+      socket = new WebSocket(WS_URL);
+      socket.onopen = () => {};
+      socket.onmessage = (event) => {
+        try {
+          latestMessage = JSON.parse(event.data);
+          draw(latestMessage);
+        } catch (_) {
+          latestMessage = null;
+          clear();
+        }
+      };
+      socket.onerror = () => {
+        socket.close();
+      };
+      socket.onclose = () => {
+        socket = null;
+        latestMessage = null;
+        clear();
+        reconnectTimer = setTimeout(connect, 1000);
+      };
+    }
+
+    window.addEventListener("resize", resizeCanvas);
+    resizeCanvas();
+    connect();
+  </script>
+</body>
+</html>

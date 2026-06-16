@@ -1,0 +1,22 @@
+{
+  "interval_ms": 1000,
+  "host": "0.0.0.0",
+  "port": 8765,
+  "capture": {
+    "monitor": 1,
+    "left": 0,
+    "top": 0,
+    "width": 2560,
+    "height": 1440
+  },
+  "match": {
+    "mode": "contains",
+    "case_sensitive": false,
+    "min_confidence": 0.5
+  },
+  "overlay": {
+    "stroke_color": "#ff3b30",
+    "line_width": 2,
+    "show_label": false
+  }
+}
