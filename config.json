@@ -1,13 +1,24 @@
-{
-  "interval_ms": 1000,
+﻿{
+  "interval_ms": 500,
   "host": "0.0.0.0",
   "port": 8765,
   "capture": {
+    "source": "obs_websocket",
     "monitor": 1,
     "left": 0,
     "top": 0,
     "width": 2560,
-    "height": 1440
+    "height": 1440,
+    "obs_websocket": {
+      "url": "ws://127.0.0.1:4455",
+      "password": "",
+      "source_name": "窗口采集",
+      "source_uuid": "",
+      "image_format": "png",
+      "image_width": 0,
+      "image_height": 0,
+      "image_compression_quality": 80
+    }
   },
   "match": {
     "mode": "contains",
@@ -16,7 +27,28 @@
   },
   "overlay": {
     "stroke_color": "#ff3b30",
+    "color_mode": "by_target",
+    "color_palette": [
+      "#ff3b30",
+      "#34c759",
+      "#007aff",
+      "#ffcc00",
+      "#af52de",
+      "#ff9500",
+      "#00c7be",
+      "#ff2d55"
+    ],
     "line_width": 2,
-    "show_label": false
+    "show_label": true
+  },
+  "desktop_overlay": {
+    "enabled": true,
+    "click_through": true,
+    "hide_when_empty": true,
+    "debug_border": false,
+    "coordinate_mode": "screen_region",
+    "screen_region": "auto",
+    "topmost": true,
+    "transparent_color": "#010101"
   }
 }

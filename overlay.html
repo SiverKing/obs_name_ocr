@@ -72,7 +72,6 @@
       const scaleY = canvas.height / message.height;
 
       ctx.save();
-      ctx.strokeStyle = overlay.stroke_color || DEFAULT_OVERLAY.stroke_color;
       ctx.lineWidth = Math.max(1, Number(overlay.line_width || DEFAULT_OVERLAY.line_width)) * dpr;
       ctx.lineJoin = "round";
       ctx.font = `${Math.round(14 * dpr)}px "Microsoft YaHei", "Segoe UI", sans-serif`;
@@ -87,6 +86,8 @@
           continue;
         }
 
+        const color = String(box.color || overlay.stroke_color || DEFAULT_OVERLAY.stroke_color);
+        ctx.strokeStyle = color;
         ctx.strokeRect(x, y, w, h);
 
         if (overlay.show_label) {
@@ -99,7 +100,7 @@
             const labelH = Math.ceil(20 * dpr);
             const labelY = Math.max(0, y - labelH - 2 * dpr);
 
-            ctx.fillStyle = overlay.stroke_color || DEFAULT_OVERLAY.stroke_color;
+            ctx.fillStyle = color;
             ctx.fillRect(x, labelY, labelW, labelH);
             ctx.fillStyle = "#ffffff";
             ctx.fillText(label, x + paddingX, labelY + paddingY);

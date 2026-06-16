@@ -2,10 +2,14 @@ import asyncio
 import base64
 import copy
 import hashlib
+import io
 import json
 import logging
+import os
+import queue
 import signal
 import struct
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,11 +30,22 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "host": "127.0.0.1",
     "port": 8765,
     "capture": {
+        "source": "screen",
         "monitor": 1,
         "left": 0,
         "top": 0,
         "width": 1920,
         "height": 1080,
+        "obs_websocket": {
+            "url": "ws://127.0.0.1:4455",
+            "password": "",
+            "source_name": "",
+            "source_uuid": "",
+            "image_format": "png",
+            "image_width": 0,
+            "image_height": 0,
+            "image_compression_quality": 80,
+        },
     },
     "match": {
         "mode": "contains",
@@ -39,12 +54,39 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "overlay": {
         "stroke_color": "#ff3b30",
+        "color_mode": "single",
+        "color_palette": [
+            "#ff3b30",
+            "#34c759",
+            "#007aff",
+            "#ffcc00",
+            "#af52de",
+            "#ff9500",
+            "#00c7be",
+            "#ff2d55",
+        ],
         "line_width": 3,
         "show_label": True,
+    },
+    "desktop_overlay": {
+        "enabled": False,
+        "click_through": True,
+        "hide_when_empty": True,
+        "debug_border": False,
+        "coordinate_mode": "capture",
+        "screen_region": {
+            "left": 0,
+            "top": 0,
+            "width": 1920,
+            "height": 1080,
+        },
+        "topmost": True,
+        "transparent_color": "#010101",
     },
 }
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+FORCE_EXIT_TIMER: Optional[threading.Timer] = None
 
 
 def setup_logging() -> None:
@@ -80,7 +122,7 @@ def load_config(write_if_missing: bool = True) -> Dict[str, Any]:
         return config
 
     try:
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
         if not isinstance(data, dict):
             raise ValueError("config.json 顶层必须是 JSON 对象")
         return deep_merge(DEFAULT_CONFIG, data)
@@ -170,6 +212,13 @@ def resolve_capture_region(sct: mss.mss, config: Dict[str, Any]) -> Tuple[Dict[s
     return region, width, height
 
 
+def get_desktop_overlay_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    current = config.get("desktop_overlay", {})
+    if not isinstance(current, dict):
+        current = {}
+    return deep_merge(DEFAULT_CONFIG["desktop_overlay"], current)
+
+
 def rect_from_points(points: Any) -> Optional[Dict[str, float]]:
     if points is None:
         return None
@@ -201,6 +250,15 @@ class OCRItem:
     text: str
     confidence: float
     rect: Dict[str, float]
+
+
+@dataclass
+class CaptureFrame:
+    image: Optional[np.ndarray]
+    region: Dict[str, int]
+    width: int
+    height: int
+    source_info: Dict[str, Any]
 
 
 class RapidOCREngine:
@@ -356,6 +414,621 @@ class RapidOCREngine:
             return OCRItem(text=str(text), confidence=float(confidence), rect=rect)
 
         return None
+
+
+class OBSWebSocketScreenshotClient:
+    def __init__(self) -> None:
+        self._ws: Any = None
+        self._url: Optional[str] = None
+        self._password: str = ""
+        self._rpc_version = 1
+        self._request_counter = 0
+
+    async def close(self) -> None:
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
+    async def capture(self, config: Dict[str, Any]) -> CaptureFrame:
+        capture = config.get("capture", {})
+        obs_config = capture.get("obs_websocket", {})
+        if not isinstance(obs_config, dict):
+            obs_config = {}
+
+        url = str(obs_config.get("url") or "ws://127.0.0.1:4455")
+        password = str(obs_config.get("password") or "")
+        source_name = str(obs_config.get("source_name") or "")
+        source_uuid = str(obs_config.get("source_uuid") or "")
+        if not source_name and not source_uuid:
+            source_name = await self._get_current_program_scene_name(url, password)
+        source_info = await self._get_source_info(url, password, source_name, source_uuid)
+
+        image_format = str(obs_config.get("image_format") or "png")
+        width_hint = int(obs_config.get("image_width") or capture.get("width") or 0)
+        height_hint = int(obs_config.get("image_height") or capture.get("height") or 0)
+        quality = int(obs_config.get("image_compression_quality") or 80)
+
+        request_data: Dict[str, Any] = {
+            "imageFormat": image_format,
+            "imageCompressionQuality": quality,
+        }
+        if source_uuid:
+            request_data["sourceUuid"] = source_uuid
+        else:
+            request_data["sourceName"] = source_name
+        if width_hint > 0:
+            request_data["imageWidth"] = width_hint
+        if height_hint > 0:
+            request_data["imageHeight"] = height_hint
+
+        response = await self._request(url, password, "GetSourceScreenshot", request_data)
+        status = response.get("requestStatus", {})
+        if not status.get("result"):
+            raise RuntimeError(f"OBS GetSourceScreenshot 失败: {status}")
+
+        image_data = response.get("responseData", {}).get("imageData", "")
+        image = self._decode_image_data(image_data)
+        height, width = image.shape[:2]
+        region = {
+            "left": int(capture.get("left", 0) or 0),
+            "top": int(capture.get("top", 0) or 0),
+            "width": width,
+            "height": height,
+        }
+        return CaptureFrame(image=image, region=region, width=width, height=height, source_info=source_info)
+
+    async def _get_source_info(self, url: str, password: str, source_name: str, source_uuid: str) -> Dict[str, Any]:
+        info: Dict[str, Any] = {
+            "source": "obs_websocket",
+            "source_name": source_name,
+            "source_uuid": source_uuid,
+        }
+        try:
+            if source_uuid:
+                response = await self._request(url, password, "GetInputSettings", {"inputUuid": source_uuid})
+            else:
+                response = await self._request(url, password, "GetInputSettings", {"inputName": source_name})
+            status = response.get("requestStatus", {})
+            if status.get("result"):
+                data = response.get("responseData", {})
+                info["input_kind"] = data.get("inputKind")
+                info["input_settings"] = data.get("inputSettings", {})
+        except Exception:
+            logging.debug("读取 OBS input settings 失败，将只使用截图尺寸", exc_info=True)
+        return info
+
+    async def _get_current_program_scene_name(self, url: str, password: str) -> str:
+        response = await self._request(url, password, "GetSceneList", {})
+        status = response.get("requestStatus", {})
+        if not status.get("result"):
+            raise RuntimeError(f"OBS GetSceneList 失败: {status}")
+        scene_name = response.get("responseData", {}).get("currentProgramSceneName")
+        if not scene_name:
+            raise RuntimeError("OBS 当前节目场景为空，请配置 source_name 或 source_uuid")
+        return str(scene_name)
+
+    async def _connect(self, url: str, password: str) -> Any:
+        if self._ws is not None and self._url == url and self._password == password:
+            return self._ws
+
+        await self.close()
+        import websockets
+
+        self._ws = await websockets.connect(
+            url,
+            subprotocols=["obswebsocket.json"],
+            max_size=None,
+        )
+        self._url = url
+        self._password = password
+
+        hello = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=5))
+        data = hello.get("d", {})
+        self._rpc_version = min(int(data.get("rpcVersion", 1)), 1)
+        identify: Dict[str, Any] = {
+            "rpcVersion": self._rpc_version,
+            "eventSubscriptions": 0,
+        }
+        auth = data.get("authentication")
+        if auth:
+            if not password:
+                raise RuntimeError("OBS WebSocket 需要密码，请填写 capture.obs_websocket.password")
+            identify["authentication"] = self._build_auth(password, auth["salt"], auth["challenge"])
+
+        await self._ws.send(json.dumps({"op": 1, "d": identify}, ensure_ascii=False))
+        identified = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=5))
+        if identified.get("op") != 2:
+            raise RuntimeError(f"OBS WebSocket Identify 失败: {identified}")
+
+        logging.info("OBS WebSocket 已连接: %s", url)
+        return self._ws
+
+    def _build_auth(self, password: str, salt: str, challenge: str) -> str:
+        secret = base64.b64encode(hashlib.sha256((password + salt).encode("utf-8")).digest())
+        return base64.b64encode(hashlib.sha256(secret + challenge.encode("utf-8")).digest()).decode("ascii")
+
+    async def _request(self, url: str, password: str, request_type: str, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        ws = await self._connect(url, password)
+        self._request_counter += 1
+        request_id = f"obs-name-ocr-{self._request_counter}"
+        payload = {
+            "op": 6,
+            "d": {
+                "requestType": request_type,
+                "requestId": request_id,
+                "requestData": request_data,
+            },
+        }
+        try:
+            await ws.send(json.dumps(payload, ensure_ascii=False))
+            while True:
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+                if msg.get("op") == 7 and msg.get("d", {}).get("requestId") == request_id:
+                    return msg["d"]
+        except Exception:
+            await self.close()
+            raise
+
+    def _decode_image_data(self, image_data: str) -> np.ndarray:
+        raw = image_data.split(",", 1)[1] if "," in image_data else image_data
+        data = base64.b64decode(raw)
+        try:
+            import cv2
+
+            array = np.frombuffer(data, dtype=np.uint8)
+            image = cv2.imdecode(array, cv2.IMREAD_COLOR)
+            if image is None:
+                raise ValueError("cv2.imdecode 返回空图像")
+            return image
+        except Exception:
+            from PIL import Image
+
+            pil_image = Image.open(io.BytesIO(data)).convert("RGB")
+            return np.asarray(pil_image)[:, :, ::-1].copy()
+
+
+class DesktopOverlay:
+    def __init__(self) -> None:
+        self._queue: queue.Queue = queue.Queue(maxsize=1)
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._failed = False
+        self._enabled = False
+
+    def update(self, message: Dict[str, Any], config: Dict[str, Any], region: Dict[str, int]) -> None:
+        overlay_config = get_desktop_overlay_config(config)
+        enabled = normalize_bool(overlay_config.get("enabled", False), False)
+
+        if not enabled or self._failed:
+            self.stop()
+            return
+
+        self._ensure_thread()
+        payload = {
+            "message": message,
+            "overlay": config.get("overlay", DEFAULT_CONFIG["overlay"]),
+            "desktop_overlay": overlay_config,
+            "region": {
+                "left": int(region["left"]),
+                "top": int(region["top"]),
+                "width": int(region["width"]),
+                "height": int(region["height"]),
+            },
+        }
+        self._replace_latest(payload)
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop_event.set()
+        self._replace_latest({"type": "stop"})
+        self._thread.join(timeout=0.3)
+        if self._thread.is_alive():
+            logging.warning("桌面透明层线程未及时退出，将随进程退出")
+        self._thread = None
+        self._stop_event.clear()
+
+    def _ensure_thread(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, name="DesktopOverlay", daemon=True)
+        self._thread.start()
+
+    def _replace_latest(self, payload: Dict[str, Any]) -> None:
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._queue.put_nowait(payload)
+        except queue.Full:
+            pass
+
+    def _run(self) -> None:
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:
+            logging.exception("无法初始化 Win32 桌面透明层")
+            self._failed = True
+            return
+
+        state: Dict[str, Any] = {
+            "region": {"left": 0, "top": 0, "width": 1, "height": 1},
+            "message": build_message(1, 1, [], DEFAULT_CONFIG),
+            "overlay": DEFAULT_CONFIG["overlay"],
+            "desktop_overlay": DEFAULT_CONFIG["desktop_overlay"],
+            "visible": False,
+        }
+
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        kernel32 = ctypes.windll.kernel32
+
+        WM_DESTROY = 0x0002
+        WM_PAINT = 0x000F
+        WM_ERASEBKGND = 0x0014
+        WM_NCHITTEST = 0x0084
+        HTTRANSPARENT = -1
+        WS_POPUP = 0x80000000
+        WS_EX_LAYERED = 0x00080000
+        WS_EX_TRANSPARENT = 0x00000020
+        WS_EX_TOPMOST = 0x00000008
+        WS_EX_TOOLWINDOW = 0x00000080
+        WS_EX_NOACTIVATE = 0x08000000
+        LWA_COLORKEY = 0x00000001
+        SW_HIDE = 0
+        SW_SHOWNOACTIVATE = 4
+        SWP_NOSIZE = 0x0001
+        SWP_NOMOVE = 0x0002
+        SWP_NOZORDER = 0x0004
+        SWP_NOACTIVATE = 0x0010
+        SWP_SHOWWINDOW = 0x0040
+        SWP_HIDEWINDOW = 0x0080
+        HWND_TOPMOST = -1
+        HWND_NOTOPMOST = -2
+        PM_REMOVE = 0x0001
+        PS_SOLID = 0
+        NULL_BRUSH = 5
+        TRANSPARENT = 1
+        DT_LEFT = 0x00000000
+        DT_TOP = 0x00000000
+        DT_SINGLELINE = 0x00000020
+
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", ctypes.c_long),
+                ("top", ctypes.c_long),
+                ("right", ctypes.c_long),
+                ("bottom", ctypes.c_long),
+            ]
+
+        class PAINTSTRUCT(ctypes.Structure):
+            _fields_ = [
+                ("hdc", wintypes.HDC),
+                ("fErase", wintypes.BOOL),
+                ("rcPaint", RECT),
+                ("fRestore", wintypes.BOOL),
+                ("fIncUpdate", wintypes.BOOL),
+                ("rgbReserved", ctypes.c_byte * 32),
+            ]
+
+        class MSG(ctypes.Structure):
+            _fields_ = [
+                ("hwnd", wintypes.HWND),
+                ("message", wintypes.UINT),
+                ("wParam", wintypes.WPARAM),
+                ("lParam", wintypes.LPARAM),
+                ("time", wintypes.DWORD),
+                ("pt", wintypes.POINT),
+            ]
+
+        WNDPROC = ctypes.WINFUNCTYPE(wintypes.LPARAM, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [
+                ("style", wintypes.UINT),
+                ("lpfnWndProc", WNDPROC),
+                ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE),
+                ("hIcon", wintypes.HICON),
+                ("hCursor", wintypes.HANDLE),
+                ("hbrBackground", wintypes.HBRUSH),
+                ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR),
+            ]
+
+        user32.BeginPaint.argtypes = [wintypes.HWND, ctypes.POINTER(PAINTSTRUCT)]
+        user32.BeginPaint.restype = wintypes.HDC
+        user32.EndPaint.argtypes = [wintypes.HWND, ctypes.POINTER(PAINTSTRUCT)]
+        user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.DefWindowProcW.restype = wintypes.LPARAM
+        user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        user32.RegisterClassW.restype = wintypes.ATOM
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.HWND,
+            wintypes.HMENU,
+            wintypes.HINSTANCE,
+            wintypes.LPVOID,
+        ]
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.DestroyWindow.argtypes = [wintypes.HWND]
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.UpdateWindow.argtypes = [wintypes.HWND]
+        user32.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
+        user32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
+        user32.PeekMessageW.argtypes = [ctypes.POINTER(MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]
+        user32.InvalidateRect.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.BOOL]
+        user32.SetLayeredWindowAttributes.argtypes = [wintypes.HWND, wintypes.COLORREF, ctypes.c_byte, wintypes.DWORD]
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        user32.FillRect.argtypes = [wintypes.HDC, ctypes.POINTER(RECT), wintypes.HBRUSH]
+        user32.DrawTextW.argtypes = [wintypes.HDC, wintypes.LPCWSTR, ctypes.c_int, ctypes.POINTER(RECT), wintypes.UINT]
+        gdi32.CreateSolidBrush.argtypes = [wintypes.COLORREF]
+        gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
+        gdi32.CreatePen.argtypes = [ctypes.c_int, ctypes.c_int, wintypes.COLORREF]
+        gdi32.CreatePen.restype = wintypes.HANDLE
+        gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HANDLE]
+        gdi32.SelectObject.restype = wintypes.HANDLE
+        gdi32.GetStockObject.argtypes = [ctypes.c_int]
+        gdi32.GetStockObject.restype = wintypes.HANDLE
+        gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
+        gdi32.Rectangle.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        gdi32.SetBkMode.argtypes = [wintypes.HDC, ctypes.c_int]
+        gdi32.SetTextColor.argtypes = [wintypes.HDC, wintypes.COLORREF]
+
+        def colorref(value: Any, fallback: str = "#ff3b30") -> int:
+            text = str(value or fallback).strip()
+            if text.startswith("#"):
+                text = text[1:]
+            if len(text) != 6:
+                text = fallback[1:]
+            try:
+                r = int(text[0:2], 16)
+                g = int(text[2:4], 16)
+                b = int(text[4:6], 16)
+            except ValueError:
+                r, g, b = 255, 59, 48
+            return r | (g << 8) | (b << 16)
+
+        def get_boxes() -> List[Dict[str, Any]]:
+            message = state["message"]
+            boxes = message.get("boxes") if isinstance(message, dict) else []
+            return boxes if isinstance(boxes, list) else []
+
+        def paint(hwnd: Any) -> int:
+            ps = PAINTSTRUCT()
+            hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
+            try:
+                region = state["region"]
+                width = max(1, int(region["width"]))
+                height = max(1, int(region["height"]))
+                overlay_config = state["desktop_overlay"]
+                bg = colorref(overlay_config.get("transparent_color"), "#010101")
+                bg_brush = gdi32.CreateSolidBrush(bg)
+                try:
+                    full = RECT(0, 0, width, height)
+                    user32.FillRect(hdc, ctypes.byref(full), bg_brush)
+                finally:
+                    gdi32.DeleteObject(bg_brush)
+
+                boxes = get_boxes()
+                debug_border = normalize_bool(overlay_config.get("debug_border", False), False)
+                if not boxes and not debug_border:
+                    return 0
+
+                message = state["message"]
+                msg_width = max(1, float(message.get("width", width)))
+                msg_height = max(1, float(message.get("height", height)))
+                scale_x = width / msg_width
+                scale_y = height / msg_height
+                overlay = state["overlay"]
+                default_color = colorref(overlay.get("stroke_color"), DEFAULT_CONFIG["overlay"]["stroke_color"])
+                line_width = max(1, int(overlay.get("line_width", DEFAULT_CONFIG["overlay"]["line_width"])))
+                show_label = normalize_bool(overlay.get("show_label", True), True)
+
+                pen = gdi32.CreatePen(PS_SOLID, line_width, default_color)
+                old_pen = gdi32.SelectObject(hdc, pen)
+                old_brush = gdi32.SelectObject(hdc, gdi32.GetStockObject(NULL_BRUSH))
+                try:
+                    if debug_border:
+                        gdi32.Rectangle(hdc, 1, 1, width - 1, height - 1)
+                    gdi32.SelectObject(hdc, old_pen)
+                    gdi32.DeleteObject(pen)
+                    pen = None
+                    for box in boxes:
+                        x = int(float(box.get("x", 0)) * scale_x)
+                        y = int(float(box.get("y", 0)) * scale_y)
+                        w = int(float(box.get("w", 0)) * scale_x)
+                        h = int(float(box.get("h", 0)) * scale_y)
+                        if w <= 0 or h <= 0:
+                            continue
+                        color = colorref(box.get("color"), overlay.get("stroke_color", DEFAULT_CONFIG["overlay"]["stroke_color"]))
+                        box_pen = gdi32.CreatePen(PS_SOLID, line_width, color)
+                        old_box_pen = gdi32.SelectObject(hdc, box_pen)
+                        gdi32.Rectangle(hdc, x, y, x + w, y + h)
+                        gdi32.SelectObject(hdc, old_box_pen)
+                        gdi32.DeleteObject(box_pen)
+                        if show_label:
+                            label = str(box.get("matched") or box.get("text") or "")
+                            if label:
+                                label_rect = RECT(x, max(0, y - 22), x + max(120, len(label) * 18), max(22, y))
+                                label_brush = gdi32.CreateSolidBrush(color)
+                                try:
+                                    user32.FillRect(hdc, ctypes.byref(label_rect), label_brush)
+                                finally:
+                                    gdi32.DeleteObject(label_brush)
+                                gdi32.SetBkMode(hdc, TRANSPARENT)
+                                gdi32.SetTextColor(hdc, colorref("#ffffff", "#ffffff"))
+                                user32.DrawTextW(
+                                    hdc,
+                                    label,
+                                    len(label),
+                                    ctypes.byref(label_rect),
+                                    DT_LEFT | DT_TOP | DT_SINGLELINE,
+                                )
+                finally:
+                    gdi32.SelectObject(hdc, old_brush)
+                    gdi32.SelectObject(hdc, old_pen)
+                    if pen:
+                        gdi32.DeleteObject(pen)
+            finally:
+                user32.EndPaint(hwnd, ctypes.byref(ps))
+            return 0
+
+        def window_proc(hwnd: Any, msg: int, wparam: Any, lparam: Any) -> int:
+            if msg == WM_NCHITTEST:
+                return HTTRANSPARENT
+            if msg == WM_ERASEBKGND:
+                return 1
+            if msg == WM_PAINT:
+                return paint(hwnd)
+            if msg == WM_DESTROY:
+                user32.PostQuitMessage(0)
+                return 0
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        wnd_proc = WNDPROC(window_proc)
+        hinstance = kernel32.GetModuleHandleW(None)
+        class_name = f"ObsNameOcrOverlay{threading.get_ident()}"
+        wnd_class = WNDCLASSW()
+        wnd_class.lpfnWndProc = wnd_proc
+        wnd_class.hInstance = hinstance
+        wnd_class.lpszClassName = class_name
+        wnd_class.hbrBackground = gdi32.GetStockObject(NULL_BRUSH)
+        atom = user32.RegisterClassW(ctypes.byref(wnd_class))
+        if not atom:
+            logging.error("注册 Win32 桌面透明层窗口类失败")
+            return
+
+        ex_style = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST
+        hwnd = user32.CreateWindowExW(
+            ex_style,
+            class_name,
+            "OBS Name OCR Overlay",
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            hinstance,
+            None,
+        )
+        if not hwnd:
+            logging.error("创建 Win32 桌面透明层窗口失败")
+            return
+        logging.info("桌面透明层窗口已创建: hwnd=%s", hwnd)
+
+        last_log_at = 0.0
+
+        def apply_window() -> None:
+            nonlocal last_log_at
+            region = state["region"]
+            width = max(1, int(region["width"]))
+            height = max(1, int(region["height"]))
+            overlay_config = state["desktop_overlay"]
+            bg = colorref(overlay_config.get("transparent_color"), "#010101")
+            user32.SetLayeredWindowAttributes(hwnd, bg, 0, LWA_COLORKEY)
+            topmost = normalize_bool(overlay_config.get("topmost", True), True)
+            hide_when_empty = normalize_bool(
+                overlay_config.get("hide_when_empty", True),
+                True,
+            )
+            boxes = get_boxes()
+            debug_border = normalize_bool(overlay_config.get("debug_border", False), False)
+            if hide_when_empty and not boxes and not debug_border:
+                if state["visible"]:
+                    user32.ShowWindow(hwnd, SW_HIDE)
+                    state["visible"] = False
+                    logging.info("桌面透明层隐藏: 无命中框")
+                return
+
+            insert_after = HWND_TOPMOST if topmost else HWND_NOTOPMOST
+            user32.SetWindowPos(
+                hwnd,
+                insert_after,
+                int(region["left"]),
+                int(region["top"]),
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+            user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+            state["visible"] = True
+            user32.InvalidateRect(hwnd, None, True)
+            user32.UpdateWindow(hwnd)
+            now = time.monotonic()
+            if now - last_log_at >= 5.0:
+                logging.info(
+                    "桌面透明层显示: left=%s top=%s width=%s height=%s boxes=%s debug_border=%s",
+                    int(region["left"]),
+                    int(region["top"]),
+                    width,
+                    height,
+                    len(boxes),
+                    debug_border,
+                )
+                last_log_at = now
+
+        def drain_queue() -> bool:
+            latest = None
+            try:
+                while True:
+                    latest = self._queue.get_nowait()
+            except queue.Empty:
+                pass
+
+            if latest is not None:
+                if latest.get("type") == "stop":
+                    return False
+                state["region"] = latest["region"]
+                state["message"] = latest["message"]
+                state["overlay"] = latest["overlay"]
+                state["desktop_overlay"] = latest["desktop_overlay"]
+                apply_window()
+            return True
+
+        msg = MSG()
+        try:
+            while not self._stop_event.is_set():
+                if not drain_queue():
+                    break
+                while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+                time.sleep(0.016)
+        except Exception:
+            logging.exception("桌面透明层运行失败")
+        finally:
+            try:
+                user32.ShowWindow(hwnd, SW_HIDE)
+                user32.DestroyWindow(hwnd)
+                user32.UnregisterClassW(class_name, hinstance)
+            except Exception:
+                pass
 
 
 @dataclass(eq=False)
@@ -627,7 +1300,12 @@ def install_signal_handlers(stop_event: asyncio.Event) -> None:
     loop = asyncio.get_running_loop()
 
     def request_stop(signum: int, _frame: Any = None) -> None:
+        global FORCE_EXIT_TIMER
         logging.info("收到退出信号 %s，正在停止 worker", signum)
+        if FORCE_EXIT_TIMER is None:
+            FORCE_EXIT_TIMER = threading.Timer(4.0, lambda: os._exit(0))
+            FORCE_EXIT_TIMER.daemon = True
+            FORCE_EXIT_TIMER.start()
         loop.call_soon_threadsafe(stop_event.set)
 
     for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
@@ -661,6 +1339,23 @@ def find_match(text: str, targets: List[str], match_config: Dict[str, Any]) -> O
     return None
 
 
+def get_box_color(matched: str, config: Dict[str, Any]) -> str:
+    overlay = config.get("overlay", {})
+    default_color = str(overlay.get("stroke_color", DEFAULT_CONFIG["overlay"]["stroke_color"]))
+    mode = str(overlay.get("color_mode", "single")).strip().lower()
+    if mode not in {"by_target", "target", "matched", "per_target"}:
+        return default_color
+
+    palette = overlay.get("color_palette", DEFAULT_CONFIG["overlay"]["color_palette"])
+    if not isinstance(palette, list) or not palette:
+        return default_color
+    normalized = str(matched or "").casefold().encode("utf-8")
+    digest = hashlib.sha1(normalized).digest()
+    index = int.from_bytes(digest[:4], "big") % len(palette)
+    color = str(palette[index])
+    return color if color.startswith("#") else default_color
+
+
 def build_message(
     width: int,
     height: int,
@@ -677,70 +1372,272 @@ def build_message(
     }
 
 
+def parse_obs_window_id(value: str) -> Dict[str, str]:
+    parts = str(value or "").split(":")
+    return {
+        "title": parts[0] if len(parts) > 0 else "",
+        "class": parts[1] if len(parts) > 1 else "",
+        "exe": parts[2] if len(parts) > 2 else "",
+    }
+
+
+def get_window_rect_from_obs_setting(window_setting: str) -> Optional[Dict[str, int]]:
+    target = parse_obs_window_id(window_setting)
+    target_title = target.get("title", "")
+    target_class = target.get("class", "")
+    target_exe = target.get("exe", "").lower()
+    if not any((target_title, target_class, target_exe)):
+        return None
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return None
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    psapi = ctypes.windll.psapi
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    psapi.GetModuleBaseNameW.argtypes = [wintypes.HANDLE, wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    PROCESS_VM_READ = 0x0010
+    matches: List[Tuple[int, Dict[str, int]]] = []
+
+    def get_text(hwnd: Any) -> str:
+        length = user32.GetWindowTextLengthW(hwnd)
+        buffer = ctypes.create_unicode_buffer(max(1, length + 1))
+        user32.GetWindowTextW(hwnd, buffer, len(buffer))
+        return buffer.value
+
+    def get_class(hwnd: Any) -> str:
+        buffer = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buffer, len(buffer))
+        return buffer.value
+
+    def get_exe(hwnd: Any) -> str:
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, False, pid.value)
+        if not handle:
+            return ""
+        try:
+            buffer = ctypes.create_unicode_buffer(260)
+            if psapi.GetModuleBaseNameW(handle, None, buffer, len(buffer)):
+                return buffer.value
+            return ""
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def score_window(title: str, cls: str, exe: str) -> int:
+        score = 0
+        if target_exe and exe.lower() == target_exe:
+            score += 10
+        if target_class and cls == target_class:
+            score += 10
+        if target_title and title == target_title:
+            score += 6
+        elif target_title and (target_title in title or title in target_title):
+            score += 3
+        return score
+
+    def enum_proc(hwnd: Any, _lparam: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        title = get_text(hwnd)
+        cls = get_class(hwnd)
+        exe = get_exe(hwnd)
+        score = score_window(title, cls, exe)
+        if score <= 0:
+            return True
+        rect = RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return True
+        width = int(rect.right - rect.left)
+        height = int(rect.bottom - rect.top)
+        if width <= 0 or height <= 0:
+            return True
+        matches.append(
+            (
+                score,
+                {
+                    "left": int(rect.left),
+                    "top": int(rect.top),
+                    "width": width,
+                    "height": height,
+                },
+            )
+        )
+        return True
+
+    callback = EnumWindowsProc(enum_proc)
+    user32.EnumWindows(callback, 0)
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item[0], reverse=True)
+    return matches[0][1]
+
+
+def resolve_desktop_overlay_region(config: Dict[str, Any], frame: CaptureFrame) -> Dict[str, int]:
+    overlay_config = get_desktop_overlay_config(config)
+    mode = str(overlay_config.get("coordinate_mode", "capture")).strip().lower()
+    if mode in {"screen", "screen_region", "display"}:
+        screen_region = overlay_config.get("screen_region", {})
+        if isinstance(screen_region, str) and screen_region.strip().lower() == "auto":
+            screen_region = {"auto": True}
+        if not isinstance(screen_region, dict):
+            screen_region = {}
+
+        auto = normalize_bool(screen_region.get("auto", False), False)
+        if auto:
+            source_info = frame.source_info or {}
+            input_settings = source_info.get("input_settings", {})
+            window_setting = input_settings.get("window") if isinstance(input_settings, dict) else None
+            if window_setting:
+                auto_region = get_window_rect_from_obs_setting(str(window_setting))
+                if auto_region is not None:
+                    return auto_region
+                logging.warning("无法自动定位 OBS 窗口采集目标窗口，将使用 screen_region 手动配置")
+
+        def int_value(key: str, default: int) -> int:
+            try:
+                return int(screen_region.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        width = int_value("width", frame.width)
+        height = int_value("height", frame.height)
+        return {
+            "left": int_value("left", frame.region.get("left", 0)),
+            "top": int_value("top", frame.region.get("top", 0)),
+            "width": width if width > 0 else frame.width,
+            "height": height if height > 0 else frame.height,
+        }
+    return frame.region
+
+
+async def capture_frame(
+    sct: mss.MSS,
+    obs_client: OBSWebSocketScreenshotClient,
+    config: Dict[str, Any],
+) -> CaptureFrame:
+    capture = config.get("capture", {})
+    source = str(capture.get("source", "screen")).strip().lower()
+    if source in {"obs", "obs_websocket", "obs-websocket"}:
+        return await obs_client.capture(config)
+
+    region, width, height = resolve_capture_region(sct, config)
+    screenshot = sct.grab(region)
+    image = np.asarray(screenshot)[:, :, :3]
+    return CaptureFrame(
+        image=image,
+        region=region,
+        width=width,
+        height=height,
+        source_info={"source": "screen"},
+    )
+
+
 async def recognition_loop(server: OverlayServer, stop_event: asyncio.Event) -> None:
     ocr = RapidOCREngine()
+    desktop_overlay = DesktopOverlay()
+    obs_client = OBSWebSocketScreenshotClient()
     with mss.MSS() as sct:
-        while not stop_event.is_set():
-            started = time.monotonic()
-            config = load_config(write_if_missing=True)
-            interval = get_interval_seconds(config)
+        try:
+            while not stop_event.is_set():
+                started = time.monotonic()
+                config = load_config(write_if_missing=True)
+                interval = get_interval_seconds(config)
 
-            try:
-                region, width, height = resolve_capture_region(sct, config)
-                targets = read_targets()
-
-                if not targets:
-                    await server.broadcast(build_message(width, height, [], config))
-                else:
-                    screenshot = sct.grab(region)
-                    image = np.asarray(screenshot)[:, :, :3]
-                    items = ocr.recognize(image)
-                    boxes: List[Dict[str, Any]] = []
-                    match_config = config.get("match", {})
-                    min_confidence = float(match_config.get("min_confidence", 0.5))
-
-                    for item in items:
-                        if item.confidence < min_confidence:
-                            continue
-                        matched = find_match(item.text, targets, match_config)
-                        if matched is None:
-                            continue
-
-                        rect = item.rect
-                        boxes.append(
-                            {
-                                "text": item.text,
-                                "matched": matched,
-                                "confidence": round(float(item.confidence), 4),
-                                "x": round(float(rect["x"]), 2),
-                                "y": round(float(rect["y"]), 2),
-                                "w": round(float(rect["w"]), 2),
-                                "h": round(float(rect["h"]), 2),
-                            }
-                        )
-
-                    await server.broadcast(build_message(width, height, boxes, config))
-                    logging.debug("本轮 OCR=%s 命中=%s 目标=%s", len(items), len(boxes), len(targets))
-            except Exception:
-                logging.exception("识别循环失败，程序继续运行")
                 try:
-                    config = load_config(write_if_missing=True)
-                    capture = config.get("capture", {})
-                    width = int(capture.get("width", DEFAULT_CONFIG["capture"]["width"]))
-                    height = int(capture.get("height", DEFAULT_CONFIG["capture"]["height"]))
-                    await server.broadcast(build_message(width, height, [], config))
-                except Exception:
-                    logging.exception("发送空框失败")
+                    targets = read_targets()
+                    boxes: List[Dict[str, Any]] = []
+                    frame = await capture_frame(sct, obs_client, config)
+                    region, width, height = frame.region, frame.width, frame.height
 
-            elapsed = time.monotonic() - started
-            wait_seconds = max(0.0, interval - elapsed)
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=wait_seconds)
-            except asyncio.TimeoutError:
-                pass
+                    if targets and frame.image is not None:
+                        items = ocr.recognize(frame.image)
+                        match_config = config.get("match", {})
+                        min_confidence = float(match_config.get("min_confidence", 0.5))
+
+                        for item in items:
+                            if item.confidence < min_confidence:
+                                continue
+                            matched = find_match(item.text, targets, match_config)
+                            if matched is None:
+                                continue
+
+                            rect = item.rect
+                            boxes.append(
+                                {
+                                    "text": item.text,
+                                    "matched": matched,
+                                    "confidence": round(float(item.confidence), 4),
+                                    "color": get_box_color(matched, config),
+                                    "x": round(float(rect["x"]), 2),
+                                    "y": round(float(rect["y"]), 2),
+                                    "w": round(float(rect["w"]), 2),
+                                    "h": round(float(rect["h"]), 2),
+                                }
+                            )
+
+                        logging.debug("本轮 OCR=%s 命中=%s 目标=%s", len(items), len(boxes), len(targets))
+
+                    message = build_message(width, height, boxes, config)
+                    await server.broadcast(message)
+                    desktop_overlay.update(message, config, resolve_desktop_overlay_region(config, frame))
+                except Exception:
+                    logging.exception("识别循环失败，程序继续运行")
+                    try:
+                        config = load_config(write_if_missing=True)
+                        capture = config.get("capture", {})
+                        width = int(capture.get("width", DEFAULT_CONFIG["capture"]["width"]))
+                        height = int(capture.get("height", DEFAULT_CONFIG["capture"]["height"]))
+                        region = {
+                            "left": int(capture.get("left", DEFAULT_CONFIG["capture"]["left"])),
+                            "top": int(capture.get("top", DEFAULT_CONFIG["capture"]["top"])),
+                            "width": width,
+                            "height": height,
+                        }
+                        message = build_message(width, height, [], config)
+                        await server.broadcast(message)
+                        desktop_overlay.update(message, config, region)
+                    except Exception:
+                        logging.exception("发送空框失败")
+
+                elapsed = time.monotonic() - started
+                wait_seconds = max(0.0, interval - elapsed)
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=wait_seconds)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            desktop_overlay.stop()
+            await obs_client.close()
 
 
 async def main_async() -> None:
+    global FORCE_EXIT_TIMER
     setup_logging()
     config = load_config(write_if_missing=True)
     host = str(config.get("host", DEFAULT_CONFIG["host"]))
@@ -761,7 +1658,13 @@ async def main_async() -> None:
             await worker_task
         except asyncio.CancelledError:
             pass
-        await server.stop()
+        try:
+            await asyncio.wait_for(server.stop(), timeout=2.0)
+        except asyncio.TimeoutError:
+            logging.warning("HTTP/WebSocket 服务停止超时，继续退出")
+        if FORCE_EXIT_TIMER is not None:
+            FORCE_EXIT_TIMER.cancel()
+            FORCE_EXIT_TIMER = None
         logging.info("worker 已停止")
 
 
