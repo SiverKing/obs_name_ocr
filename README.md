@@ -20,7 +20,65 @@ cd D:\SiverKing\VSCode\python\obs_name_ocr
 .\venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-RapidOCR 默认需要 `onnxruntime`，已写入 `requirements.txt`。
+RapidOCR 默认需要 CPU 版 `onnxruntime`，已写入 `requirements.txt`。如果要使用 NVIDIA 显卡加速，请看下面的“NVIDIA 显卡加速”章节。
+
+### NVIDIA 显卡加速
+
+默认安装的是 CPU 版 ONNX Runtime。要让 RapidOCR 调用 NVIDIA 显卡，需要换成 GPU 版 `onnxruntime-gpu`，并安装它需要的 CUDA/cuDNN 运行时。
+
+先停止 worker，然后执行：
+
+```powershell
+cd D:\SiverKing\VSCode\python\obs_name_ocr
+.\venv\Scripts\python.exe -m pip uninstall -y onnxruntime onnxruntime-gpu onnxruntime-directml
+.\venv\Scripts\python.exe -m pip install --upgrade "onnxruntime-gpu[cuda,cudnn]"
+```
+
+检查 ONNX Runtime 是否能看到 CUDA provider：
+
+```powershell
+.\venv\Scripts\python.exe -c "import onnxruntime as ort; print(ort.__version__); print(ort.get_available_providers()); print(ort.get_device())"
+```
+
+正常至少应该看到：
+
+```text
+['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+```
+
+然后把 `config.json` 里的 OCR 配置改成：
+
+```json
+"ocr": {
+  "use_cuda": true,
+  "use_dml": false,
+  "use_cls": false,
+  "return_word_box": false,
+  "reload_files_interval_ms": 2000,
+  "log_performance": true,
+  "log_performance_interval_ms": 3000
+}
+```
+
+启动 worker 后，日志里应该出现类似：
+
+```text
+已加入 NVIDIA DLL 搜索路径: ...\nvidia\cublas\bin; ...\nvidia\cudnn\bin; ...
+尝试预加载 ONNX Runtime CUDA/cuDNN DLL
+RapidOCR ONNX Runtime providers: {'det': ['CUDAExecutionProvider', 'CPUExecutionProvider'], 'cls': ['CUDAExecutionProvider', 'CPUExecutionProvider'], 'rec': ['CUDAExecutionProvider', 'CPUExecutionProvider']}
+```
+
+如果只看到 `CPUExecutionProvider`，说明当前仍是 CPU 推理。
+
+常见问题：
+
+- `onnxruntime is not installed`：没有安装 ONNX Runtime，执行 `pip install -r requirements.txt` 或安装 GPU 版。
+- `CUDAExecutionProvider is not in available providers`：装的是 CPU 版 `onnxruntime`，需要卸载后安装 `onnxruntime-gpu[cuda,cudnn]`。
+- `cublasLt64_13.dll is missing`：GPU 版 ONNX Runtime 已安装，但 CUDA 运行库缺失或不在路径里。优先用 `pip install --upgrade "onnxruntime-gpu[cuda,cudnn]"` 补齐。
+- `Could not locate cudnn_engines_tensor_ir64_9.dll` 或 `CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED`：cuDNN 子 DLL 没被加载。当前 worker 会自动把 `venv\Lib\site-packages\nvidia\*\bin` 加入进程 DLL 搜索路径和 `PATH`，请确认你运行的是最新 `worker.py`。
+- `CUDAExecutionProvider` 后面仍带着 `CPUExecutionProvider` 是正常的，CPU 是 fallback；只要 provider 列表里 CUDA 在前面，说明会优先走显卡。
+
+实测 2560x1440 原图从数秒级 OCR 降到约 `ocr=470-580ms`。如果仍然慢，优先检查输入分辨率、OBS WebSocket 截图耗时和命中框数量。
 
 ## 启动 worker
 
@@ -189,6 +247,35 @@ Windows 缩放会让文字和窗口变大，但截图区域仍按实际像素处
   - `exact`：OCR 结果必须和目标完全一致。
 - `case_sensitive`：是否大小写敏感。
 - `min_confidence`：最低 OCR 置信度。漏识别可降到 `0.3`，误框多可升到 `0.7`。
+
+### OCR 性能 ocr
+
+```json
+"ocr": {
+  "use_cuda": false,
+  "use_dml": false,
+  "use_cls": false,
+  "return_word_box": false,
+  "reload_files_interval_ms": 2000,
+  "log_performance": true,
+  "log_performance_interval_ms": 3000
+}
+```
+
+- `use_cuda`：是否让 RapidOCR 的 ONNX Runtime 优先使用 NVIDIA CUDA。需要安装 GPU 版 `onnxruntime`，并且 provider 列表里出现 `CUDAExecutionProvider` 才会真正生效。
+- `use_dml`：是否使用 Windows DirectML provider。需要安装 `onnxruntime-directml`。如果你是 NVIDIA 显卡，通常优先尝试 `use_cuda`。
+- `use_cls`：是否启用文字方向分类。水平文字场景建议 `false`，速度更快。
+- `return_word_box`：是否返回词级框。当前匹配不需要，建议 `false`。
+- `reload_files_interval_ms`：重新读取 `config.json` 和 `name.txt` 的间隔。默认 `2000`。
+- `log_performance`：是否在终端输出每轮耗时，例如截图、OCR、总耗时。
+- `log_performance_interval_ms`：性能日志输出间隔，避免每轮刷屏。
+
+性能优化建议：
+
+- OBS WebSocket 模式下优先降低 `capture.obs_websocket.image_width/image_height`，例如 `1280x720` 或 `960x540`。
+- 可以把 `image_format` 改成 `jpg`，`image_compression_quality` 设置 `60-80`。
+- 截图尺寸越大，OCR 越慢。2K/4K 原图通常明显慢于 720p。
+- 如果小字识别变差，再把 `image_width/image_height` 调高。
 
 ### 画框样式 overlay
 

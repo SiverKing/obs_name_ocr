@@ -8,6 +8,7 @@ import logging
 import os
 import queue
 import signal
+import site
 import struct
 import threading
 import time
@@ -51,6 +52,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "mode": "contains",
         "case_sensitive": False,
         "min_confidence": 0.5,
+    },
+    "ocr": {
+        "use_cuda": False,
+        "use_dml": False,
+        "use_cls": False,
+        "return_word_box": False,
+        "reload_files_interval_ms": 2000,
+        "log_performance": True,
+        "log_performance_interval_ms": 3000,
     },
     "overlay": {
         "stroke_color": "#ff3b30",
@@ -264,28 +274,135 @@ class CaptureFrame:
 class RapidOCREngine:
     def __init__(self) -> None:
         self._engine: Any = None
+        self._engine_params: Dict[str, Any] = {}
         self._import_error_logged = False
 
-    def _ensure_engine(self) -> bool:
-        if self._engine is not None:
+    def _build_engine_params(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        ocr_config = config.get("ocr", {})
+        return {
+            "EngineConfig.onnxruntime.use_cuda": normalize_bool(
+                ocr_config.get("use_cuda", False), False
+            ),
+            "EngineConfig.onnxruntime.use_dml": normalize_bool(
+                ocr_config.get("use_dml", False), False
+            ),
+        }
+
+    def _ensure_engine(self, config: Dict[str, Any]) -> bool:
+        engine_params = self._build_engine_params(config)
+        if self._engine is not None and engine_params == self._engine_params:
             return True
+
+        old_engine = self._engine
+        old_params = self._engine_params
+
         try:
+            self._preload_onnxruntime_dlls(engine_params)
             from rapidocr import RapidOCR
 
-            self._engine = RapidOCR()
+            if old_engine is not None:
+                logging.info("OCR 引擎配置变化，正在重新初始化 RapidOCR")
+
+            new_engine = RapidOCR(params=engine_params)
+            self._engine = new_engine
+            self._engine_params = engine_params
             logging.info("RapidOCR 初始化完成")
+            self._log_runtime_providers()
             return True
         except Exception:
+            if old_engine is not None:
+                self._engine = old_engine
+                self._engine_params = old_params
+                logging.exception("RapidOCR 重新初始化失败，继续使用上一个 OCR 引擎")
+                return True
+
             if not self._import_error_logged:
                 logging.exception("RapidOCR 初始化失败，将继续运行并发送空框")
                 self._import_error_logged = True
             return False
 
-    def recognize(self, image: np.ndarray) -> List[OCRItem]:
-        if not self._ensure_engine():
+    def _preload_onnxruntime_dlls(self, engine_params: Dict[str, Any]) -> None:
+        if not (
+            engine_params.get("EngineConfig.onnxruntime.use_cuda")
+            or engine_params.get("EngineConfig.onnxruntime.use_dml")
+        ):
+            return
+
+        nvidia_bin_dirs = self._add_nvidia_dll_directories()
+
+        try:
+            import onnxruntime as ort
+        except Exception:
+            return
+
+        preload_dlls = getattr(ort, "preload_dlls", None)
+        if not callable(preload_dlls):
+            return
+
+        try:
+            logging.info("尝试预加载 ONNX Runtime CUDA/cuDNN DLL")
+            preload_dlls()
+            for bin_dir in nvidia_bin_dirs:
+                preload_dlls(directory=str(bin_dir))
+        except Exception:
+            logging.exception("ONNX Runtime DLL 预加载失败，将继续尝试初始化 RapidOCR")
+
+    def _add_nvidia_dll_directories(self) -> List[Path]:
+        candidates: List[Path] = []
+        for site_dir in site.getsitepackages():
+            nvidia_dir = Path(site_dir) / "nvidia"
+            if nvidia_dir.exists():
+                candidates.extend(nvidia_dir.glob("*/bin"))
+
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        added: List[str] = []
+        for bin_dir in candidates:
+            if not bin_dir.is_dir():
+                continue
+            bin_dir_text = str(bin_dir)
+            if callable(add_dll_directory):
+                try:
+                    add_dll_directory(bin_dir_text)
+                except OSError:
+                    logging.debug("无法加入 DLL 搜索路径: %s", bin_dir, exc_info=True)
+            added.append(bin_dir_text)
+
+        if added:
+            old_path = os.environ.get("PATH", "")
+            existing = {item.lower() for item in old_path.split(os.pathsep) if item}
+            missing = [path for path in added if path.lower() not in existing]
+            if missing:
+                os.environ["PATH"] = os.pathsep.join(missing + [old_path])
+            logging.info("已加入 NVIDIA DLL 搜索路径: %s", "; ".join(added))
+        return [Path(path) for path in added]
+
+    def _log_runtime_providers(self) -> None:
+        providers: Dict[str, Any] = {}
+        for name, attr_name in (
+            ("det", "text_det"),
+            ("cls", "text_cls"),
+            ("rec", "text_rec"),
+        ):
+            component = getattr(self._engine, attr_name, None)
+            infer_session = getattr(component, "session", None)
+            ort_session = getattr(infer_session, "session", None)
+            get_providers = getattr(ort_session, "get_providers", None)
+            if callable(get_providers):
+                providers[name] = get_providers()
+
+        if providers:
+            logging.info("RapidOCR ONNX Runtime providers: %s", providers)
+
+    def recognize(self, image: np.ndarray, config: Dict[str, Any]) -> List[OCRItem]:
+        if not self._ensure_engine(config):
             return []
         try:
-            raw = self._engine(image)
+            ocr_config = config.get("ocr", {})
+            raw = self._engine(
+                image,
+                use_cls=normalize_bool(ocr_config.get("use_cls", False), False),
+                return_word_box=normalize_bool(ocr_config.get("return_word_box", False), False),
+            )
             return list(self._normalize(raw))
         except Exception:
             logging.exception("OCR 识别失败，当前轮发送空框")
@@ -1562,21 +1679,34 @@ async def recognition_loop(server: OverlayServer, stop_event: asyncio.Event) -> 
     ocr = RapidOCREngine()
     desktop_overlay = DesktopOverlay()
     obs_client = OBSWebSocketScreenshotClient()
+    config = load_config(write_if_missing=True)
+    targets = read_targets()
+    last_reload_at = 0.0
+    last_perf_log_at = 0.0
     with mss.MSS() as sct:
         try:
             while not stop_event.is_set():
                 started = time.monotonic()
-                config = load_config(write_if_missing=True)
+                now = time.monotonic()
+                reload_interval = int(config.get("ocr", {}).get("reload_files_interval_ms", 2000)) / 1000.0
+                if now - last_reload_at >= max(0.2, reload_interval):
+                    config = load_config(write_if_missing=True)
+                    targets = read_targets()
+                    last_reload_at = now
                 interval = get_interval_seconds(config)
 
                 try:
-                    targets = read_targets()
                     boxes: List[Dict[str, Any]] = []
+                    capture_started = time.monotonic()
                     frame = await capture_frame(sct, obs_client, config)
+                    capture_elapsed = time.monotonic() - capture_started
                     region, width, height = frame.region, frame.width, frame.height
 
+                    ocr_elapsed = 0.0
                     if targets and frame.image is not None:
-                        items = ocr.recognize(frame.image)
+                        ocr_started = time.monotonic()
+                        items = ocr.recognize(frame.image, config)
+                        ocr_elapsed = time.monotonic() - ocr_started
                         match_config = config.get("match", {})
                         min_confidence = float(match_config.get("min_confidence", 0.5))
 
@@ -1606,6 +1736,22 @@ async def recognition_loop(server: OverlayServer, stop_event: asyncio.Event) -> 
                     message = build_message(width, height, boxes, config)
                     await server.broadcast(message)
                     desktop_overlay.update(message, config, resolve_desktop_overlay_region(config, frame))
+                    perf_interval = int(config.get("ocr", {}).get("log_performance_interval_ms", 3000)) / 1000.0
+                    perf_now = time.monotonic()
+                    if (
+                        normalize_bool(config.get("ocr", {}).get("log_performance", True), True)
+                        and perf_now - last_perf_log_at >= max(0.5, perf_interval)
+                    ):
+                        logging.info(
+                            "性能: capture=%.0fms ocr=%.0fms total=%.0fms image=%sx%s boxes=%s",
+                            capture_elapsed * 1000,
+                            ocr_elapsed * 1000,
+                            (time.monotonic() - started) * 1000,
+                            width,
+                            height,
+                            len(boxes),
+                        )
+                        last_perf_log_at = perf_now
                 except Exception:
                     logging.exception("识别循环失败，程序继续运行")
                     try:

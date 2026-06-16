@@ -25,6 +25,15 @@
     "case_sensitive": false,
     "min_confidence": 0.5
   },
+  "ocr": {
+    "use_cuda": true,
+    "use_dml": false,
+    "use_cls": false,
+    "return_word_box": false,
+    "reload_files_interval_ms": 2000,
+    "log_performance": true,
+    "log_performance_interval_ms": 3000
+  },
   "overlay": {
     "stroke_color": "#ff3b30",
     "color_mode": "by_target",
