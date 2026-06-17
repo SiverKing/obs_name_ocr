@@ -1,9 +1,9 @@
-﻿{
+{
   "interval_ms": 500,
   "host": "0.0.0.0",
   "port": 8765,
   "capture": {
-    "source": "obs_websocket",
+    "source": "screen",
     "monitor": 1,
     "left": 0,
     "top": 0,
@@ -17,13 +17,13 @@
       "image_format": "png",
       "image_width": 0,
       "image_height": 0,
-      "image_compression_quality": 80
+      "image_compression_quality": 100
     }
   },
   "match": {
     "mode": "contains",
     "case_sensitive": false,
-    "min_confidence": 0.5
+    "min_confidence": 0.45
   },
   "ocr": {
     "use_cuda": true,
@@ -48,7 +48,7 @@
       "#ff2d55"
     ],
     "line_width": 2,
-    "show_label": true
+    "show_label": false
   },
   "desktop_overlay": {
     "enabled": true,

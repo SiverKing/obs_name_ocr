@@ -5,3 +5,4 @@ mss
 websockets
 rapidocr
 onnxruntime
+PySide6

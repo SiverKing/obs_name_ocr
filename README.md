@@ -7,6 +7,7 @@ worker 会读取当前目录的 `name.txt`，按 `config.json` 配置截图并 O
 ## 文件说明
 
 - `worker.py`：OCR worker，负责截图、识别、匹配、HTTP/WebSocket 服务和可选桌面透明覆盖层。
+- `gui.py`：本地桌面 UI，用于编辑 `name.txt`、修改 `config.json`、启动/停止 worker、测试 OBS WebSocket 和查看最近日志。
 - `overlay.html`：OBS 浏览器源使用的透明 canvas 画框页面。
 - `obs_name_ocr.py`：OBS Python 脚本，只负责启动/停止 worker。
 - `config.json`：运行配置。
@@ -79,6 +80,21 @@ RapidOCR ONNX Runtime providers: {'det': ['CUDAExecutionProvider', 'CPUExecution
 - `CUDAExecutionProvider` 后面仍带着 `CPUExecutionProvider` 是正常的，CPU 是 fallback；只要 provider 列表里 CUDA 在前面，说明会优先走显卡。
 
 实测 2560x1440 原图从数秒级 OCR 降到约 `ocr=470-580ms`。如果仍然慢，优先检查输入分辨率、OBS WebSocket 截图耗时和命中框数量。
+
+## 启动桌面 UI
+
+```powershell
+cd D:\SiverKing\VSCode\python\obs_name_ocr
+.\venv\Scripts\python.exe .\gui.py
+```
+
+桌面 UI 不需要浏览器页面板。它可以直接编辑 `name.txt`，用中文表单修改 `config.json`，启动或停止 `worker.py`，测试 OBS WebSocket 连接，获取 OBS 场景和输入源并回填 `source_name` / `source_uuid`，底部会自动刷新 `worker.log` 最近 5 行。
+
+如果没有使用项目自带虚拟环境，也可以用当前 Python 运行：
+
+```powershell
+python .\gui.py
+```
 
 ## 启动 worker
 
@@ -446,42 +462,23 @@ OBS 浏览器源：
 - 不一定会被游戏捕获源捕获到。
 - 如果 OBS 使用显示器捕获，通常能捕获到这个透明层；如果 OBS 使用游戏捕获，可能捕获不到。
 
-## 能不能直接指定 OBS 某个捕获源
+## OBS 捕获源选择
 
-当前 `worker.py` 还不能直接指定 OBS 内部某一个捕获源作为 OCR 输入，它现在使用的是 Windows 屏幕区域截图。
+`worker.py` 支持两类截图来源：
 
-如果指的是 OBS Python 脚本 API 直接拿实时源纹理像素，这不是一个适合本项目的常规路线。OBS 的源画面在 OBS 渲染管线内部，直接拿源画面通常需要走插件、渲染回调或 GPU 纹理读回，容易接近 C/C++ 插件方案。
+- `screen`：使用 Windows 屏幕区域截图，按 `monitor/left/top/width/height` 读取。
+- `obs_websocket`：通过 OBS WebSocket 5.x 的 `GetSourceScreenshot` 按 `source_name` 或 `source_uuid` 获取 OBS 场景或输入源截图。
 
-如果可以接受通过 OBS WebSocket 取低频截图，OBS WebSocket 5.x 协议提供 `GetSourceScreenshot`，可以按 `sourceName` 或 `sourceUuid` 获取输入源或场景的 Base64 截图。这适合后续做“选择 OBS 源后每 1000ms 截图 OCR”的方案，但它不是高帧率实时视频帧流，频率太高会有性能和延迟成本。
+推荐用 `gui.py` 选择 OBS 来源：
 
-当前项目第一版刻意不做 C++ 插件，也不阻塞 OBS 渲染线程，所以采用屏幕区域截图方案。
+1. 启动 OBS，并确认“工具 > WebSocket 服务器设置”已开启。
+2. 运行 `python .\gui.py`。
+3. 在“截图来源”里把 `source` 设为 `obs_websocket`。
+4. 填写 OBS WebSocket `url` 和 `password`。
+5. 点击“测试 OBS 连接”。
+6. 点击“获取 OBS 捕获对象”，选择场景或输入源后会自动回填 `source_name` 和 `source_uuid`。
+7. 点击“保存配置”。
 
-## 后续可做的捕获源选择 GUI 方案
+`source_uuid` 优先级高于 `source_name`。如果 OBS 里重命名了来源但 UUID 没变，保留 UUID 通常更稳定。
 
-可以做一个独立 GUI，让你像 OBS 添加捕获源一样选择：
-
-- 显示器捕获：列出所有显示器。
-- 窗口捕获：列出当前可见窗口标题。
-- 区域捕获：手动输入或拖拽选择 `left/top/width/height`。
-- OBS 源截图：连接 OBS WebSocket，列出 OBS 场景、输入源和场景项，选择后使用 `GetSourceScreenshot` 做低频 OCR。
-
-第一版推荐实现路线：
-
-1. 增加 `capture.source_type`：
-   - `monitor`
-   - `window`
-   - `region`
-2. 增加一个 `selector.py`：
-   - 用 Tkinter 显示选择窗口。
-   - 显示 monitor 列表。
-   - 显示可见窗口标题列表。
-   - 选择后写回 `config.json`。
-3. `worker.py` 仍然使用 mss 截图：
-   - monitor 模式截整块显示器。
-   - region 模式截固定区域。
-   - window 模式根据窗口句柄获取窗口矩形，然后按这个矩形截图。
-   - obs_source 模式通过 OBS WebSocket 请求源截图。
-
-这个 GUI 方案可以做到“体验接近 OBS 的选择源”。其中 monitor/window/region 本质仍是 Windows 屏幕/窗口区域截图；obs_source 模式则依赖 OBS WebSocket 的源截图接口。
-
-如果确实要读取 OBS 内部源的实时帧流，建议另开一个 C++ OBS 插件；如果只是 1000ms 左右的 OCR，OBS WebSocket 截图模式可以作为下一版优先方案。
+OBS WebSocket 截图适合 500ms 到数秒级的 OCR 轮询，不是高帧率实时帧流。频率太高时，优先降低 `interval_ms` 的压力、降低 `image_width/image_height`，或改用 `jpg` 并适当调低 `image_compression_quality`。
