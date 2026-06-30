@@ -14,6 +14,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -26,6 +27,7 @@ CONFIG_PATH = BASE_DIR / "config.json"
 NAME_PATH = BASE_DIR / "name.txt"
 OVERLAY_PATH = BASE_DIR / "overlay.html"
 LOG_PATH = BASE_DIR / "worker.log"
+OCR_OUTPUT_PATH = BASE_DIR / "ocr_output.txt"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "interval_ms": 1000,
@@ -53,6 +55,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "mode": "contains",
         "case_sensitive": False,
         "min_confidence": 0.5,
+    },
+    "match_tolerance": {
+        "enabled": True,
+        "normalize_confusable": True,
+        "collapse_repeated_chars": True,
+        "ignore_separators": True,
+        "max_edit_distance": 1,
+        "fuzzy_enabled": True,
+        "fuzzy_threshold": 0.88,
+        "fuzzy_min_length": 4,
+    },
+    "ocr_output": {
+        "enabled": True,
     },
     "ocr": {
         "use_cuda": False,
@@ -303,6 +318,13 @@ class OCRItem:
     text: str
     confidence: float
     rect: Dict[str, float]
+
+
+@dataclass
+class MatchResult:
+    target: str
+    method: str
+    score: float = 1.0
 
 
 @dataclass
@@ -1508,7 +1530,105 @@ def install_signal_handlers(stop_event: asyncio.Event) -> None:
                 pass
 
 
-def find_match(text: str, targets: List[str], match_config: Dict[str, Any]) -> Optional[str]:
+def get_match_tolerance_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    current = config.get("match_tolerance", {})
+    if not isinstance(current, dict):
+        current = {}
+    return deep_merge(DEFAULT_CONFIG["match_tolerance"], current)
+
+
+def get_ocr_output_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    current = config.get("ocr_output", {})
+    if not isinstance(current, dict):
+        current = {}
+    return deep_merge(DEFAULT_CONFIG["ocr_output"], current)
+
+
+def match_text(source: str, needle: str, mode: str) -> bool:
+    if mode == "exact":
+        return source == needle
+    return needle in source
+
+
+def normalize_confusable_text(text: str, case_sensitive: bool) -> str:
+    replacements = {
+        "0": "o",
+        "1": "l",
+        "I": "l",
+        "|": "l",
+        "!": "l",
+        "5": "s",
+        "$": "s",
+    }
+    normalized = "".join(replacements.get(char, char) for char in text)
+    return normalized if case_sensitive else normalized.casefold()
+
+
+def collapse_repeated_chars(text: str) -> str:
+    if not text:
+        return text
+
+    result = [text[0]]
+    for char in text[1:]:
+        if char != result[-1]:
+            result.append(char)
+    return "".join(result)
+
+
+def strip_match_separators(text: str) -> str:
+    return "".join(char for char in text if char not in {"_", "-", " ", "\t"})
+
+
+def prepare_tolerant_text(text: str, case_sensitive: bool, tolerance_config: Dict[str, Any]) -> str:
+    prepared = text if case_sensitive else text.casefold()
+    if normalize_bool(tolerance_config.get("normalize_confusable", True), True):
+        prepared = normalize_confusable_text(text, case_sensitive)
+    if normalize_bool(tolerance_config.get("collapse_repeated_chars", True), True):
+        prepared = collapse_repeated_chars(prepared)
+    if normalize_bool(tolerance_config.get("ignore_separators", True), True):
+        prepared = strip_match_separators(prepared)
+    return prepared
+
+
+def similarity_score(source: str, needle: str) -> float:
+    if not source or not needle:
+        return 0.0
+    return SequenceMatcher(None, source, needle).ratio()
+
+
+def limited_edit_distance(left: str, right: str, max_distance: int) -> int:
+    if max_distance < 0:
+        return max_distance + 1
+    if abs(len(left) - len(right)) > max_distance:
+        return max_distance + 1
+    if left == right:
+        return 0
+
+    previous = list(range(len(right) + 1))
+    for left_index, left_char in enumerate(left, 1):
+        current = [left_index]
+        row_min = current[0]
+        for right_index, right_char in enumerate(right, 1):
+            cost = 0 if left_char == right_char else 1
+            value = min(
+                previous[right_index] + 1,
+                current[right_index - 1] + 1,
+                previous[right_index - 1] + cost,
+            )
+            current.append(value)
+            row_min = min(row_min, value)
+        if row_min > max_distance:
+            return max_distance + 1
+        previous = current
+    return previous[-1]
+
+
+def find_match_detail(
+    text: str,
+    targets: List[str],
+    match_config: Dict[str, Any],
+    tolerance_config: Optional[Dict[str, Any]] = None,
+) -> Optional[MatchResult]:
     if not text or not targets:
         return None
 
@@ -1518,12 +1638,76 @@ def find_match(text: str, targets: List[str], match_config: Dict[str, Any]) -> O
 
     for target in targets:
         needle = target if case_sensitive else target.casefold()
-        if mode == "exact":
-            matched = source == needle
-        else:
-            matched = needle in source
-        if matched:
-            return target
+        if match_text(source, needle, mode):
+            return MatchResult(target=target, method="原始匹配", score=1.0)
+
+    tolerance = deep_merge(DEFAULT_CONFIG["match_tolerance"], tolerance_config or {})
+    if not normalize_bool(tolerance.get("enabled", True), True):
+        return None
+
+    tolerant_source = prepare_tolerant_text(text, case_sensitive, tolerance)
+    for target in targets:
+        tolerant_needle = prepare_tolerant_text(target, case_sensitive, tolerance)
+        if match_text(tolerant_source, tolerant_needle, mode):
+            return MatchResult(target=target, method="归一化/重复字符容错", score=1.0)
+
+    try:
+        max_edit_distance = int(tolerance.get("max_edit_distance", 1))
+    except (TypeError, ValueError):
+        max_edit_distance = 1
+    max_edit_distance = max(0, max_edit_distance)
+
+    try:
+        min_length = int(tolerance.get("fuzzy_min_length", 4))
+    except (TypeError, ValueError):
+        min_length = 4
+    min_length = max(1, min_length)
+
+    if max_edit_distance > 0 and len(tolerant_source) >= min_length:
+        best_result: Optional[MatchResult] = None
+        for target in targets:
+            tolerant_needle = prepare_tolerant_text(target, case_sensitive, tolerance)
+            if len(tolerant_needle) < min_length:
+                continue
+            distance = limited_edit_distance(tolerant_source, tolerant_needle, max_edit_distance)
+            if distance <= max_edit_distance:
+                score = 1.0 - (distance / max(len(tolerant_source), len(tolerant_needle), 1))
+                if best_result is None or score > best_result.score:
+                    best_result = MatchResult(target=target, method="编辑距离容错", score=score)
+        if best_result is not None:
+            return best_result
+
+    if not normalize_bool(tolerance.get("fuzzy_enabled", True), True):
+        return None
+
+    try:
+        threshold = float(tolerance.get("fuzzy_threshold", 0.88))
+    except (TypeError, ValueError):
+        threshold = 0.88
+    threshold = min(1.0, max(0.0, threshold))
+
+    best_result: Optional[MatchResult] = None
+    for target in targets:
+        tolerant_needle = prepare_tolerant_text(target, case_sensitive, tolerance)
+        if len(tolerant_source) < min_length or len(tolerant_needle) < min_length:
+            continue
+
+        score = similarity_score(tolerant_source, tolerant_needle)
+        if score >= threshold and (best_result is None or score > best_result.score):
+            best_result = MatchResult(target=target, method="相似度容错", score=score)
+
+    return best_result
+
+
+def find_match(
+    text: str,
+    targets: List[str],
+    match_config: Dict[str, Any],
+    tolerance_config: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    result = find_match_detail(text, targets, match_config, tolerance_config)
+    if result is not None:
+        return result.target
     return None
 
 
@@ -1542,6 +1726,71 @@ def get_box_color(matched: str, config: Dict[str, Any]) -> str:
     index = int.from_bytes(digest[:4], "big") % len(palette)
     color = str(palette[index])
     return color if color.startswith("#") else default_color
+
+
+def clean_ocr_debug_text(text: Any) -> str:
+    return str(text).replace("\r", "\\r").replace("\n", "\\n")
+
+
+def write_ocr_output(
+    items: List[OCRItem],
+    targets: List[str],
+    match_config: Dict[str, Any],
+    tolerance_config: Dict[str, Any],
+    min_confidence: float,
+    frame: CaptureFrame,
+    ocr_elapsed: float,
+    skipped_reason: str = "",
+) -> None:
+    lines = [
+        "OCR 原始识别结果",
+        f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"截图来源: {frame.source_info.get('source', 'unknown') if isinstance(frame.source_info, dict) else 'unknown'}",
+        f"图像尺寸: {frame.width}x{frame.height}",
+        f"截图区域: left={frame.region.get('left', 0)} top={frame.region.get('top', 0)} width={frame.region.get('width', frame.width)} height={frame.region.get('height', frame.height)}",
+        f"目标数量: {len(targets)}",
+        f"匹配模式: {match_config.get('mode', DEFAULT_CONFIG['match']['mode'])}",
+        f"大小写敏感: {normalize_bool(match_config.get('case_sensitive', False), False)}",
+        f"min_confidence: {min_confidence:.4f}",
+        f"容错匹配: {normalize_bool(tolerance_config.get('enabled', True), True)}",
+        f"字符归一化: {normalize_bool(tolerance_config.get('normalize_confusable', True), True)}",
+        f"重复字符压缩: {normalize_bool(tolerance_config.get('collapse_repeated_chars', True), True)}",
+        f"忽略分隔符: {normalize_bool(tolerance_config.get('ignore_separators', True), True)}",
+        f"最大编辑距离: {int(tolerance_config.get('max_edit_distance', 1))}",
+        f"相似度匹配: {normalize_bool(tolerance_config.get('fuzzy_enabled', True), True)}",
+        f"相似度阈值: {float(tolerance_config.get('fuzzy_threshold', 0.88)):.4f}",
+        f"OCR 耗时: {ocr_elapsed * 1000:.0f}ms",
+        f"原始条目数: {len(items)}",
+    ]
+
+    if skipped_reason:
+        lines.extend(["", skipped_reason])
+    elif not items:
+        lines.extend(["", "未识别到任何文本"])
+    else:
+        lines.append("")
+        for index, item in enumerate(items, 1):
+            rect = item.rect
+            match_result = find_match_detail(item.text, targets, match_config, tolerance_config)
+            if item.confidence < min_confidence:
+                status = "低于置信度阈值"
+            elif match_result is not None:
+                status = f"命中目标: {match_result.target} ({match_result.method}"
+                if match_result.score < 1.0:
+                    status += f", score={match_result.score:.4f}"
+                status += ")"
+            else:
+                status = "未命中目标"
+            lines.append(
+                f"{index:03d} | {status} | conf={float(item.confidence):.4f} "
+                f"| rect=x={float(rect['x']):.2f},y={float(rect['y']):.2f},w={float(rect['w']):.2f},h={float(rect['h']):.2f} "
+                f"| text={clean_ocr_debug_text(item.text)}"
+            )
+
+    try:
+        OCR_OUTPUT_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:
+        logging.exception("写入 OCR 原始识别结果失败: %s", OCR_OUTPUT_PATH)
 
 
 def build_message(
@@ -1773,18 +2022,26 @@ async def recognition_loop(server: OverlayServer, stop_event: asyncio.Event) -> 
                     capture_elapsed = time.monotonic() - capture_started
                     region, width, height = frame.region, frame.width, frame.height
 
+                    items: List[OCRItem] = []
                     ocr_elapsed = 0.0
-                    if targets and frame.image is not None:
+                    match_config = config.get("match", {})
+                    tolerance_config = get_match_tolerance_config(config)
+                    ocr_output_config = get_ocr_output_config(config)
+                    min_confidence = float(match_config.get("min_confidence", 0.5))
+                    skipped_reason = ""
+                    if frame.image is None:
+                        skipped_reason = "未执行 OCR：当前截图为空"
+                    elif not targets:
+                        skipped_reason = "未执行 OCR：name.txt 没有有效目标"
+                    else:
                         ocr_started = time.monotonic()
                         items = ocr.recognize(frame.image, config)
                         ocr_elapsed = time.monotonic() - ocr_started
-                        match_config = config.get("match", {})
-                        min_confidence = float(match_config.get("min_confidence", 0.5))
 
                         for item in items:
                             if item.confidence < min_confidence:
                                 continue
-                            matched = find_match(item.text, targets, match_config)
+                            matched = find_match(item.text, targets, match_config, tolerance_config)
                             if matched is None:
                                 continue
 
@@ -1803,6 +2060,17 @@ async def recognition_loop(server: OverlayServer, stop_event: asyncio.Event) -> 
                             )
 
                         logging.debug("本轮 OCR=%s 命中=%s 目标=%s", len(items), len(boxes), len(targets))
+                    if normalize_bool(ocr_output_config.get("enabled", True), True):
+                        write_ocr_output(
+                            items,
+                            targets,
+                            match_config,
+                            tolerance_config,
+                            min_confidence,
+                            frame,
+                            ocr_elapsed,
+                            skipped_reason,
+                        )
 
                     message = build_message(width, height, boxes, config)
                     await server.broadcast(message)

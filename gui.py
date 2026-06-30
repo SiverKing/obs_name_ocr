@@ -85,6 +85,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "case_sensitive": False,
         "min_confidence": 0.5,
     },
+    "match_tolerance": {
+        "enabled": True,
+        "normalize_confusable": True,
+        "collapse_repeated_chars": True,
+        "ignore_separators": True,
+        "max_edit_distance": 1,
+        "fuzzy_enabled": True,
+        "fuzzy_threshold": 0.88,
+        "fuzzy_min_length": 4,
+    },
+    "ocr_output": {
+        "enabled": True,
+    },
     "ocr": {
         "use_cuda": False,
         "use_dml": False,
@@ -549,6 +562,8 @@ class MainWindow(QMainWindow):
         self._add_service_group()
         self._add_capture_group()
         self._add_match_group()
+        self._add_match_tolerance_group()
+        self._add_debug_output_group()
         self._add_ocr_group()
         self._add_overlay_group()
         self.config_layout.addStretch(1)
@@ -747,6 +762,55 @@ class MainWindow(QMainWindow):
         self.min_confidence_spin.setSingleStep(0.05)
         self.min_confidence_spin.setDecimals(2)
         form.addRow("min_confidence", self.min_confidence_spin)
+
+        self.config_layout.addWidget(group)
+
+    def _add_match_tolerance_group(self) -> None:
+        group = self._group("匹配容错 match_tolerance")
+        form = self._form(group)
+
+        self.match_tolerance_enabled_check = QCheckBox("启用容错匹配", self)
+        form.addRow("enabled", self.match_tolerance_enabled_check)
+
+        self.normalize_confusable_check = QCheckBox("兼容 1/l/I、0/O、5/S 等易混字符", self)
+        form.addRow("normalize_confusable", self.normalize_confusable_check)
+
+        self.collapse_repeated_chars_check = QCheckBox("压缩连续重复字符，例如 kk -> k", self)
+        form.addRow("collapse_repeated_chars", self.collapse_repeated_chars_check)
+
+        self.ignore_separators_check = QCheckBox("忽略 _、-、空格等分隔符", self)
+        form.addRow("ignore_separators", self.ignore_separators_check)
+
+        self.max_edit_distance_spin = QSpinBox(self)
+        self.max_edit_distance_spin.setRange(0, 8)
+        form.addRow("max_edit_distance", self.max_edit_distance_spin)
+
+        self.fuzzy_enabled_check = QCheckBox("启用相似度匹配", self)
+        form.addRow("fuzzy_enabled", self.fuzzy_enabled_check)
+
+        self.fuzzy_threshold_spin = QDoubleSpinBox(self)
+        self.fuzzy_threshold_spin.setRange(0.0, 1.0)
+        self.fuzzy_threshold_spin.setSingleStep(0.01)
+        self.fuzzy_threshold_spin.setDecimals(2)
+        form.addRow("fuzzy_threshold", self.fuzzy_threshold_spin)
+
+        self.fuzzy_min_length_spin = QSpinBox(self)
+        self.fuzzy_min_length_spin.setRange(1, 128)
+        form.addRow("fuzzy_min_length", self.fuzzy_min_length_spin)
+
+        self.config_layout.addWidget(group)
+
+    def _add_debug_output_group(self) -> None:
+        group = self._group("诊断输出 ocr_output")
+        form = self._form(group)
+
+        self.ocr_output_enabled_check = QCheckBox("输出 ocr_output.txt", self)
+        form.addRow("enabled", self.ocr_output_enabled_check)
+
+        hint = QLabel("开启后每轮覆盖写入最近一次 OCR 原始识别内容，用于排查漏识别。")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        form.addRow("", hint)
 
         self.config_layout.addWidget(group)
 
@@ -979,6 +1043,12 @@ class MainWindow(QMainWindow):
         capture = self.config.get("capture", {})
         obs = capture.get("obs_websocket", {}) if isinstance(capture.get("obs_websocket"), dict) else {}
         match = self.config.get("match", {})
+        match_tolerance = self.config.get("match_tolerance", {})
+        if not isinstance(match_tolerance, dict):
+            match_tolerance = {}
+        ocr_output = self.config.get("ocr_output", {})
+        if not isinstance(ocr_output, dict):
+            ocr_output = {}
         ocr = self.config.get("ocr", {})
         overlay = self.config.get("overlay", {})
         desktop_overlay = self.config.get("desktop_overlay", {})
@@ -1006,6 +1076,17 @@ class MainWindow(QMainWindow):
         set_combo_data(self.match_mode_combo, str(match.get("mode", "contains")))
         self.case_sensitive_check.setChecked(bool_value(match.get("case_sensitive"), False))
         self.min_confidence_spin.setValue(float(match.get("min_confidence", 0.5)))
+
+        self.match_tolerance_enabled_check.setChecked(bool_value(match_tolerance.get("enabled"), True))
+        self.normalize_confusable_check.setChecked(bool_value(match_tolerance.get("normalize_confusable"), True))
+        self.collapse_repeated_chars_check.setChecked(bool_value(match_tolerance.get("collapse_repeated_chars"), True))
+        self.ignore_separators_check.setChecked(bool_value(match_tolerance.get("ignore_separators"), True))
+        self.max_edit_distance_spin.setValue(int(match_tolerance.get("max_edit_distance", 1)))
+        self.fuzzy_enabled_check.setChecked(bool_value(match_tolerance.get("fuzzy_enabled"), True))
+        self.fuzzy_threshold_spin.setValue(float(match_tolerance.get("fuzzy_threshold", 0.88)))
+        self.fuzzy_min_length_spin.setValue(int(match_tolerance.get("fuzzy_min_length", 4)))
+
+        self.ocr_output_enabled_check.setChecked(bool_value(ocr_output.get("enabled"), True))
 
         self.use_cuda_check.setChecked(bool_value(ocr.get("use_cuda"), False))
         self.use_dml_check.setChecked(bool_value(ocr.get("use_dml"), False))
@@ -1035,6 +1116,8 @@ class MainWindow(QMainWindow):
             raise ValueError("image_width/image_height 不能小于 0")
         if not 0.0 <= self.min_confidence_spin.value() <= 1.0:
             raise ValueError("min_confidence 必须在 0-1 之间")
+        if not 0.0 <= self.fuzzy_threshold_spin.value() <= 1.0:
+            raise ValueError("fuzzy_threshold 必须在 0-1 之间")
 
         config = copy.deepcopy(self.config)
         config["interval_ms"] = self.interval_spin.value()
@@ -1063,6 +1146,19 @@ class MainWindow(QMainWindow):
         match["mode"] = str(self.match_mode_combo.currentData() or "contains")
         match["case_sensitive"] = self.case_sensitive_check.isChecked()
         match["min_confidence"] = self.min_confidence_spin.value()
+
+        match_tolerance = ensure_dict(config, "match_tolerance")
+        match_tolerance["enabled"] = self.match_tolerance_enabled_check.isChecked()
+        match_tolerance["normalize_confusable"] = self.normalize_confusable_check.isChecked()
+        match_tolerance["collapse_repeated_chars"] = self.collapse_repeated_chars_check.isChecked()
+        match_tolerance["ignore_separators"] = self.ignore_separators_check.isChecked()
+        match_tolerance["max_edit_distance"] = self.max_edit_distance_spin.value()
+        match_tolerance["fuzzy_enabled"] = self.fuzzy_enabled_check.isChecked()
+        match_tolerance["fuzzy_threshold"] = self.fuzzy_threshold_spin.value()
+        match_tolerance["fuzzy_min_length"] = self.fuzzy_min_length_spin.value()
+
+        ocr_output = ensure_dict(config, "ocr_output")
+        ocr_output["enabled"] = self.ocr_output_enabled_check.isChecked()
 
         ocr = ensure_dict(config, "ocr")
         ocr["use_cuda"] = self.use_cuda_check.isChecked()

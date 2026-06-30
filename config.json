@@ -13,7 +13,7 @@
       "url": "ws://127.0.0.1:4455",
       "password": "",
       "source_name": "窗口采集",
-      "source_uuid": "f61a4ab8-ce23-457a-8e29-e18545d21854",
+      "source_uuid": "0bff0c8b-4869-478a-ad97-f8f5c6e23568",
       "image_format": "png",
       "image_width": 0,
       "image_height": 0,
@@ -21,9 +21,22 @@
     }
   },
   "match": {
-    "mode": "contains",
+    "mode": "exact",
     "case_sensitive": false,
-    "min_confidence": 0.1
+    "min_confidence": 0.5
+  },
+  "match_tolerance": {
+    "enabled": true,
+    "normalize_confusable": true,
+    "collapse_repeated_chars": true,
+    "ignore_separators": true,
+    "max_edit_distance": 1,
+    "fuzzy_enabled": true,
+    "fuzzy_threshold": 0.88,
+    "fuzzy_min_length": 4
+  },
+  "ocr_output": {
+    "enabled": false
   },
   "ocr": {
     "use_cuda": true,

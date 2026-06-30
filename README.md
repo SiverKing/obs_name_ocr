@@ -264,6 +264,42 @@ Windows 缩放会让文字和窗口变大，但截图区域仍按实际像素处
 - `case_sensitive`：是否大小写敏感。
 - `min_confidence`：最低 OCR 置信度。漏识别可降到 `0.3`，误框多可升到 `0.7`。
 
+### 匹配容错 match_tolerance
+
+```json
+"match_tolerance": {
+  "enabled": true,
+  "normalize_confusable": true,
+  "collapse_repeated_chars": true,
+  "ignore_separators": true,
+  "max_edit_distance": 1,
+  "fuzzy_enabled": true,
+  "fuzzy_threshold": 0.88,
+  "fuzzy_min_length": 4
+}
+```
+
+这组配置只在原始 `match` 没命中时生效，用来处理 OCR 把字符读错或漏掉重复字符的情况。
+
+- `enabled`：是否启用匹配容错。
+- `normalize_confusable`：归一化易混字符，例如 `1/l/I`、`0/O`、`5/S`。
+- `collapse_repeated_chars`：压缩连续重复字符，例如 `asdopjkkf` 和 `asdopjkf` 会按同一结果比较。
+- `ignore_separators`：忽略 `_`、`-`、空格等分隔符，适合 OCR 漏读尾部符号的情况。
+- `max_edit_distance`：允许的最大编辑距离，默认 `1`，可处理 `Nuo1i_` 被识别成 `Nuoi_` 这类少读一个字符的情况。
+- `fuzzy_enabled`：是否启用相似度匹配兜底。
+- `fuzzy_threshold`：相似度命中阈值，默认 `0.88`。误报多就调高，仍漏识别就小幅调低。
+- `fuzzy_min_length`：目标文字长度小于该值时不做相似度匹配，避免短目标误报。
+
+### OCR 原始输出 ocr_output
+
+```json
+"ocr_output": {
+  "enabled": true
+}
+```
+
+- `enabled`：是否输出 `ocr_output.txt`。开启后 worker 每轮覆盖写入最近一次 OCR 原始识别内容，用于排查“识别错了”还是“没识别到”。
+
 ### OCR 性能 ocr
 
 ```json

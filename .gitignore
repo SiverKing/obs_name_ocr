@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 *.pyd
 *.log
+ocr_output.txt
 *.spec
 *.exe
 .env
@@ -10,5 +11,4 @@ __pycache__/
 venv/
 dist/
 build
-
 
