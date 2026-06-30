@@ -1,9 +1,9 @@
 {
   "interval_ms": 500,
   "host": "0.0.0.0",
-  "port": 8765,
+  "port": 8766,
   "capture": {
-    "source": "screen",
+    "source": "obs_websocket",
     "monitor": 1,
     "left": 0,
     "top": 0,
@@ -13,7 +13,7 @@
       "url": "ws://127.0.0.1:4455",
       "password": "",
       "source_name": "窗口采集",
-      "source_uuid": "",
+      "source_uuid": "f61a4ab8-ce23-457a-8e29-e18545d21854",
       "image_format": "png",
       "image_width": 0,
       "image_height": 0,
@@ -23,7 +23,7 @@
   "match": {
     "mode": "contains",
     "case_sensitive": false,
-    "min_confidence": 0.45
+    "min_confidence": 0.1
   },
   "ocr": {
     "use_cuda": true,
@@ -35,7 +35,7 @@
     "log_performance_interval_ms": 3000
   },
   "overlay": {
-    "stroke_color": "#ff3b30",
+    "stroke_color": "#ffffff",
     "color_mode": "by_target",
     "color_palette": [
       "#ff3b30",
@@ -47,8 +47,8 @@
       "#00c7be",
       "#ff2d55"
     ],
-    "line_width": 2,
-    "show_label": false
+    "line_width": 3,
+    "show_label": true
   },
   "desktop_overlay": {
     "enabled": true,

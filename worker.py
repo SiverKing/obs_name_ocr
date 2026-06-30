@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import copy
+import errno
 import hashlib
 import io
 import json
@@ -139,6 +140,48 @@ def load_config(write_if_missing: bool = True) -> Dict[str, Any]:
     except Exception:
         logging.exception("读取 config.json 失败，当前轮使用默认配置")
         return copy.deepcopy(DEFAULT_CONFIG)
+
+
+def normalize_startup_port(value: Any) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        port = int(DEFAULT_CONFIG["port"])
+        logging.warning("config.json port 无效，启动时回退到默认端口: %s", port)
+
+    if port < 1 or port > 65535:
+        default_port = int(DEFAULT_CONFIG["port"])
+        logging.warning("config.json port=%s 超出 1-65535，启动时回退到默认端口: %s", port, default_port)
+        return default_port
+    return port
+
+
+def is_address_in_use_error(exc: OSError) -> bool:
+    return (
+        exc.errno == errno.EADDRINUSE
+        or getattr(exc, "winerror", None) == 10048
+        or "address already in use" in str(exc).lower()
+        or "通常每个套接字地址" in str(exc)
+    )
+
+
+def save_config_port(port: int, previous_port: int) -> None:
+    try:
+        if CONFIG_PATH.exists():
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+            if not isinstance(data, dict):
+                raise ValueError("config.json 顶层必须是 JSON 对象")
+        else:
+            data = {}
+
+        data["port"] = port
+        CONFIG_PATH.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        logging.info("已将 config.json 端口从 %s 更新为 %s", previous_port, port)
+    except Exception:
+        logging.exception("写入 config.json 端口失败，请手动把 port 改为 %s", port)
 
 
 def read_targets() -> List[str]:
@@ -1413,6 +1456,34 @@ class OverlayServer:
             pass
 
 
+async def start_overlay_server_with_available_port(host: str, requested_port: Any) -> OverlayServer:
+    first_port = normalize_startup_port(requested_port)
+    port = first_port
+
+    while port <= 65535:
+        server = OverlayServer(host, port)
+        try:
+            await server.start()
+        except OSError as exc:
+            if not is_address_in_use_error(exc):
+                raise
+
+            if port >= 65535:
+                raise RuntimeError("端口 65535 已被占用，无法继续自动递增端口") from exc
+
+            next_port = port + 1
+            logging.warning("端口 %s 已被占用，自动尝试下一个端口 %s", port, next_port)
+            port = next_port
+            continue
+
+        if port != first_port:
+            save_config_port(port, first_port)
+            logging.info("端口自动调整完成，worker 当前监听端口: %s", port)
+        return server
+
+    raise RuntimeError(f"从端口 {first_port} 到 65535 都不可用，worker 无法启动")
+
+
 def install_signal_handlers(stop_event: asyncio.Event) -> None:
     loop = asyncio.get_running_loop()
 
@@ -1787,13 +1858,12 @@ async def main_async() -> None:
     setup_logging()
     config = load_config(write_if_missing=True)
     host = str(config.get("host", DEFAULT_CONFIG["host"]))
-    port = int(config.get("port", DEFAULT_CONFIG["port"]))
+    port = config.get("port", DEFAULT_CONFIG["port"])
 
     stop_event = asyncio.Event()
     install_signal_handlers(stop_event)
 
-    server = OverlayServer(host, port)
-    await server.start()
+    server = await start_overlay_server_with_available_port(host, port)
     worker_task = asyncio.create_task(recognition_loop(server, stop_event))
 
     try:
