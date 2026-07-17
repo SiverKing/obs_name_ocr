@@ -858,7 +858,7 @@ class MainWindow(QMainWindow):
 
         self.color_mode_combo = QComboBox(self)
         self.color_mode_combo.addItem("单色", "single")
-        self.color_mode_combo.addItem("按目标文字分色", "by_target")
+        self.color_mode_combo.addItem("按目标动态分色", "by_target")
         form.addRow("color_mode", self.color_mode_combo)
 
         self.line_width_spin = QSpinBox(self)

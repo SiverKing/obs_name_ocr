@@ -353,8 +353,8 @@ Windows 缩放会让文字和窗口变大，但截图区域仍按实际像素处
 - `stroke_color`：框颜色。
 - `color_mode`：颜色模式。
   - `single`：所有命中框使用同一个 `stroke_color`。
-  - `by_target`：不同目标文字使用不同颜色；同一个目标每次颜色稳定一致。
-- `color_palette`：`by_target` 模式使用的颜色池。目标文字会被稳定映射到其中一个颜色。
+  - `by_target`：根据当前 `name.txt` 动态生成高区分度颜色，每个不同目标分配一个不重复颜色；目标列表不变时颜色保持稳定。
+- `color_palette`：保留用于旧配置兼容；当前动态 `by_target` 模式不再受固定颜色池数量限制。
 - `line_width`：框线宽度。
 - `show_label`：是否显示命中的文字标签。
 

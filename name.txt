@@ -1,6 +1,6 @@
 # 每行一个目标文字，空行和 # 开头的行会被忽略
 # 管理员
-7Azz
+7Azzz
 AWM
 2vss
 17-nino
@@ -13,13 +13,20 @@ taizi
 2uss
 Nuo1i
 8Dvalz6eq
+ShaoHua
+qilet
 # 黑名单
 asdopjkkf
 Hawkstrike
 LiuYouyin
 liuyinyin
 Kqeuaiev759
-# 临时
 DSPXSHTCD
+# 临时
 jibaliangwanmi
 jibaliangwa
+Zahnghb
+# 片
+zikjba2
+ozkxncjk
+asb54zw

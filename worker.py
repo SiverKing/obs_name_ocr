@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import colorsys
 import copy
 import errno
 import hashlib
@@ -15,6 +16,7 @@ import threading
 import time
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -1711,21 +1713,89 @@ def find_match(
     return None
 
 
-def get_box_color(matched: str, config: Dict[str, Any]) -> str:
+def rgb_distance_squared(left: Tuple[int, int, int], right: Tuple[int, int, int]) -> int:
+    return sum((left_channel - right_channel) ** 2 for left_channel, right_channel in zip(left, right))
+
+
+@lru_cache(maxsize=64)
+def generate_distinct_colors(count: int) -> Tuple[str, ...]:
+    if count <= 0:
+        return ()
+
+    candidates: List[Tuple[int, int, int]] = []
+    seen_candidates: set[Tuple[int, int, int]] = set()
+    hue_steps = max(72, min(360, count * 4))
+    for hue_index in range(hue_steps):
+        hue = hue_index / hue_steps
+        for saturation in (0.68, 0.82, 0.96):
+            for value in (0.78, 0.90, 1.0):
+                red, green, blue = colorsys.hsv_to_rgb(hue, saturation, value)
+                rgb = (round(red * 255), round(green * 255), round(blue * 255))
+                luminance = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+                if luminance < 75 or rgb in seen_candidates:
+                    continue
+                seen_candidates.add(rgb)
+                candidates.append(rgb)
+
+    selected: List[Tuple[int, int, int]] = [(242, 48, 48)]
+    remaining = [candidate for candidate in candidates if candidate != selected[0]]
+    while len(selected) < count and remaining:
+        best = max(
+            remaining,
+            key=lambda candidate: (
+                min(rgb_distance_squared(candidate, current) for current in selected),
+                sum(candidate),
+            ),
+        )
+        selected.append(best)
+        remaining.remove(best)
+
+    golden_ratio = 0.618033988749895
+    while len(selected) < count:
+        index = len(selected)
+        red, green, blue = colorsys.hsv_to_rgb((index * golden_ratio) % 1.0, 0.86, 0.92)
+        candidate = (round(red * 255), round(green * 255), round(blue * 255))
+        if candidate not in selected:
+            selected.append(candidate)
+
+    return tuple(f"#{red:02x}{green:02x}{blue:02x}" for red, green, blue in selected)
+
+
+def build_target_color_map(targets: List[str], config: Dict[str, Any]) -> Dict[str, str]:
+    overlay = config.get("overlay", {})
+    mode = str(overlay.get("color_mode", "single")).strip().lower()
+    if mode not in {"by_target", "target", "matched", "per_target"}:
+        return {}
+
+    unique_targets: List[str] = []
+    seen: set[str] = set()
+    for target in targets:
+        key = str(target).casefold()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique_targets.append(key)
+
+    colors = generate_distinct_colors(len(unique_targets))
+    return dict(zip(unique_targets, colors))
+
+
+def get_box_color(
+    matched: str,
+    config: Dict[str, Any],
+    target_color_map: Optional[Dict[str, str]] = None,
+) -> str:
     overlay = config.get("overlay", {})
     default_color = str(overlay.get("stroke_color", DEFAULT_CONFIG["overlay"]["stroke_color"]))
     mode = str(overlay.get("color_mode", "single")).strip().lower()
     if mode not in {"by_target", "target", "matched", "per_target"}:
         return default_color
 
-    palette = overlay.get("color_palette", DEFAULT_CONFIG["overlay"]["color_palette"])
-    if not isinstance(palette, list) or not palette:
-        return default_color
-    normalized = str(matched or "").casefold().encode("utf-8")
-    digest = hashlib.sha1(normalized).digest()
-    index = int.from_bytes(digest[:4], "big") % len(palette)
-    color = str(palette[index])
-    return color if color.startswith("#") else default_color
+    if target_color_map:
+        color = target_color_map.get(str(matched or "").casefold())
+        if color:
+            return color
+    return default_color
 
 
 def clean_ocr_debug_text(text: Any) -> str:
@@ -2001,6 +2071,7 @@ async def recognition_loop(server: OverlayServer, stop_event: asyncio.Event) -> 
     obs_client = OBSWebSocketScreenshotClient()
     config = load_config(write_if_missing=True)
     targets = read_targets()
+    target_color_map = build_target_color_map(targets, config)
     last_reload_at = 0.0
     last_perf_log_at = 0.0
     with mss.MSS() as sct:
@@ -2012,6 +2083,7 @@ async def recognition_loop(server: OverlayServer, stop_event: asyncio.Event) -> 
                 if now - last_reload_at >= max(0.2, reload_interval):
                     config = load_config(write_if_missing=True)
                     targets = read_targets()
+                    target_color_map = build_target_color_map(targets, config)
                     last_reload_at = now
                 interval = get_interval_seconds(config)
 
@@ -2051,7 +2123,7 @@ async def recognition_loop(server: OverlayServer, stop_event: asyncio.Event) -> 
                                     "text": item.text,
                                     "matched": matched,
                                     "confidence": round(float(item.confidence), 4),
-                                    "color": get_box_color(matched, config),
+                                    "color": get_box_color(matched, config, target_color_map),
                                     "x": round(float(rect["x"]), 2),
                                     "y": round(float(rect["y"]), 2),
                                     "w": round(float(rect["w"]), 2),
