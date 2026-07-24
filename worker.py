@@ -201,21 +201,45 @@ def save_config_port(port: int, previous_port: int) -> None:
         logging.exception("写入 config.json 端口失败，请手动把 port 改为 %s", port)
 
 
-def read_targets() -> List[str]:
+def parse_targets(content: str) -> Tuple[List[str], Dict[str, str]]:
+    targets: List[str] = []
+    target_groups: Dict[str, str] = {}
+    current_group = ""
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            current_group = line[1:].strip()
+            continue
+
+        targets.append(line)
+        # 匹配按 name.txt 顺序取第一个目标，重复目标的分组也保持相同规则。
+        target_groups.setdefault(line.casefold(), current_group)
+
+    return targets, target_groups
+
+
+def read_targets_and_groups() -> Tuple[List[str], Dict[str, str]]:
     if not NAME_PATH.exists():
-        return []
+        return [], {}
 
     try:
-        targets: List[str] = []
-        for raw_line in NAME_PATH.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            targets.append(line)
-        return targets
+        return parse_targets(NAME_PATH.read_text(encoding="utf-8"))
     except Exception:
         logging.exception("读取 name.txt 失败，当前轮使用空目标列表")
-        return []
+        return [], {}
+
+
+def read_targets() -> List[str]:
+    targets, _ = read_targets_and_groups()
+    return targets
+
+
+def build_target_label(target: str, target_groups: Dict[str, str]) -> str:
+    group = target_groups.get(str(target).casefold(), "")
+    return f"{group}-{target}" if group else target
 
 
 def normalize_bool(value: Any, default: bool) -> bool:
@@ -1055,7 +1079,9 @@ class DesktopOverlay:
                         gdi32.SelectObject(hdc, old_box_pen)
                         gdi32.DeleteObject(box_pen)
                         if show_label:
-                            label = str(box.get("matched") or box.get("text") or "")
+                            label = str(
+                                box.get("label") or box.get("matched") or box.get("text") or ""
+                            )
                             if label:
                                 label_rect = RECT(x, max(0, y - 22), x + max(120, len(label) * 18), max(22, y))
                                 label_brush = gdi32.CreateSolidBrush(color)
@@ -2070,7 +2096,7 @@ async def recognition_loop(server: OverlayServer, stop_event: asyncio.Event) -> 
     desktop_overlay = DesktopOverlay()
     obs_client = OBSWebSocketScreenshotClient()
     config = load_config(write_if_missing=True)
-    targets = read_targets()
+    targets, target_groups = read_targets_and_groups()
     target_color_map = build_target_color_map(targets, config)
     last_reload_at = 0.0
     last_perf_log_at = 0.0
@@ -2082,7 +2108,7 @@ async def recognition_loop(server: OverlayServer, stop_event: asyncio.Event) -> 
                 reload_interval = int(config.get("ocr", {}).get("reload_files_interval_ms", 2000)) / 1000.0
                 if now - last_reload_at >= max(0.2, reload_interval):
                     config = load_config(write_if_missing=True)
-                    targets = read_targets()
+                    targets, target_groups = read_targets_and_groups()
                     target_color_map = build_target_color_map(targets, config)
                     last_reload_at = now
                 interval = get_interval_seconds(config)
@@ -2122,6 +2148,7 @@ async def recognition_loop(server: OverlayServer, stop_event: asyncio.Event) -> 
                                 {
                                     "text": item.text,
                                     "matched": matched,
+                                    "label": build_target_label(matched, target_groups),
                                     "confidence": round(float(item.confidence), 4),
                                     "color": get_box_color(matched, config, target_color_map),
                                     "x": round(float(rect["x"]), 2),

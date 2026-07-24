@@ -91,7 +91,7 @@
         ctx.strokeRect(x, y, w, h);
 
         if (overlay.show_label) {
-          const label = String(box.matched || box.text || "");
+          const label = String(box.label || box.matched || box.text || "");
           if (label) {
             const paddingX = 5 * dpr;
             const paddingY = 3 * dpr;

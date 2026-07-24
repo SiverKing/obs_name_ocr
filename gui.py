@@ -518,7 +518,7 @@ class MainWindow(QMainWindow):
         self.name_editor.setPlaceholderText("每行一个目标文字")
         layout.addWidget(self.name_editor, 1)
 
-        hint = QLabel("空行和 # 开头行会被 worker 忽略。保存后无需重启 worker。")
+        hint = QLabel("# 开头行设置后续目标的分组；空行会被忽略。保存后无需重启 worker。")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
