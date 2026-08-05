@@ -27,7 +27,7 @@
   <canvas id="overlay"></canvas>
 
   <script>
-    const WS_URL = "ws://127.0.0.1:8765/ws";
+    const WS_URL = `ws://${location.host}/ws`;
     const DEFAULT_OVERLAY = {
       stroke_color: "#ff3b30",
       line_width: 3,
