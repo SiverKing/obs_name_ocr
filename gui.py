@@ -57,6 +57,16 @@ WORKER_PATH = BASE_DIR / "worker.py"
 WORKER_LOG_PATH = BASE_DIR / "worker.log"
 GUI_WORKER_LOG_PATH = BASE_DIR / "gui_worker.log"
 
+OCR_BACKEND_ONNXRUNTIME = "onnxruntime"
+OCR_BACKEND_TENSORRT_FP32 = "tensorrt_fp32"
+OCR_BACKEND_TENSORRT_FP16 = "tensorrt_fp16"
+OCR_BACKEND_OPTIONS = (
+    ("关闭 TensorRT（ONNX Runtime）", OCR_BACKEND_ONNXRUNTIME),
+    ("TensorRT FP32（准确度优先）", OCR_BACKEND_TENSORRT_FP32),
+    ("TensorRT FP16（速度优先）", OCR_BACKEND_TENSORRT_FP16),
+)
+OCR_BACKEND_VALUES = tuple(value for _, value in OCR_BACKEND_OPTIONS)
+
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "interval_ms": 1000,
@@ -99,6 +109,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "enabled": True,
     },
     "ocr": {
+        "backend": OCR_BACKEND_ONNXRUNTIME,
         "use_cuda": False,
         "use_dml": False,
         "use_cls": False,
@@ -178,6 +189,12 @@ def bool_value(value: Any, default: bool = False) -> bool:
         if lowered in {"0", "false", "no", "off"}:
             return False
     return default
+
+
+def normalize_ocr_backend(value: Any) -> str:
+    if isinstance(value, str) and value in OCR_BACKEND_VALUES:
+        return value
+    return OCR_BACKEND_ONNXRUNTIME
 
 
 def parse_screen_region(text: str) -> Any:
@@ -818,11 +835,29 @@ class MainWindow(QMainWindow):
         group = self._group("OCR 设置")
         form = self._form(group)
 
+        self.backend_combo = QComboBox(self)
+        for label, value in OCR_BACKEND_OPTIONS:
+            self.backend_combo.addItem(label, value)
+        form.addRow("backend", self.backend_combo)
+
         self.use_cuda_check = QCheckBox("启用 CUDA", self)
         form.addRow("use_cuda", self.use_cuda_check)
 
         self.use_dml_check = QCheckBox("启用 DirectML", self)
         form.addRow("use_dml", self.use_dml_check)
+
+        self.backend_combo.currentIndexChanged.connect(
+            self.update_ocr_backend_controls
+        )
+
+        backend_hint = QLabel(
+            "TensorRT 仅适用于 NVIDIA GPU。首次初始化会编译并缓存 Engine，"
+            "可能耗时数分钟。FP32 与当前结果最接近；FP16 更快，但阈值附近"
+            "可能出现微小浮点差异。"
+        )
+        backend_hint.setObjectName("hint")
+        backend_hint.setWordWrap(True)
+        form.addRow("", backend_hint)
 
         self.use_cls_check = QCheckBox("启用方向分类", self)
         form.addRow("use_cls", self.use_cls_check)
@@ -1088,6 +1123,10 @@ class MainWindow(QMainWindow):
 
         self.ocr_output_enabled_check.setChecked(bool_value(ocr_output.get("enabled"), True))
 
+        set_combo_data(
+            self.backend_combo,
+            normalize_ocr_backend(ocr.get("backend", OCR_BACKEND_ONNXRUNTIME)),
+        )
         self.use_cuda_check.setChecked(bool_value(ocr.get("use_cuda"), False))
         self.use_dml_check.setChecked(bool_value(ocr.get("use_dml"), False))
         self.use_cls_check.setChecked(bool_value(ocr.get("use_cls"), False))
@@ -1104,6 +1143,7 @@ class MainWindow(QMainWindow):
         self.screen_region_edit.setText(format_screen_region(desktop_overlay.get("screen_region", "auto")))
 
         self.update_obs_controls()
+        self.update_ocr_backend_controls()
 
     def build_config_from_form(self) -> Dict[str, Any]:
         if self.interval_spin.value() < 100:
@@ -1161,6 +1201,7 @@ class MainWindow(QMainWindow):
         ocr_output["enabled"] = self.ocr_output_enabled_check.isChecked()
 
         ocr = ensure_dict(config, "ocr")
+        ocr["backend"] = normalize_ocr_backend(self.backend_combo.currentData())
         ocr["use_cuda"] = self.use_cuda_check.isChecked()
         ocr["use_dml"] = self.use_dml_check.isChecked()
         ocr["use_cls"] = self.use_cls_check.isChecked()
@@ -1214,6 +1255,14 @@ class MainWindow(QMainWindow):
         busy = self.obs_thread is not None and self.obs_thread.isRunning()
         for widget in obs_widgets:
             widget.setEnabled(enabled and not busy)
+
+    def update_ocr_backend_controls(self) -> None:
+        use_onnxruntime = (
+            normalize_ocr_backend(self.backend_combo.currentData())
+            == OCR_BACKEND_ONNXRUNTIME
+        )
+        self.use_cuda_check.setEnabled(use_onnxruntime)
+        self.use_dml_check.setEnabled(use_onnxruntime)
 
     def current_obs_credentials(self) -> Dict[str, str]:
         return {

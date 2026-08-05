@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from functools import lru_cache
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -30,6 +31,20 @@ NAME_PATH = BASE_DIR / "name.txt"
 OVERLAY_PATH = BASE_DIR / "overlay.html"
 LOG_PATH = BASE_DIR / "worker.log"
 OCR_OUTPUT_PATH = BASE_DIR / "ocr_output.txt"
+
+OCR_BACKEND_ONNXRUNTIME = "onnxruntime"
+OCR_BACKEND_TENSORRT_FP32 = "tensorrt_fp32"
+OCR_BACKEND_TENSORRT_FP16 = "tensorrt_fp16"
+OCR_BACKEND_VALUES = (
+    OCR_BACKEND_ONNXRUNTIME,
+    OCR_BACKEND_TENSORRT_FP32,
+    OCR_BACKEND_TENSORRT_FP16,
+)
+OCR_BACKEND_LABELS = {
+    OCR_BACKEND_ONNXRUNTIME: "ONNX Runtime",
+    OCR_BACKEND_TENSORRT_FP32: "RapidOCR 原生 TensorRT FP32",
+    OCR_BACKEND_TENSORRT_FP16: "RapidOCR 原生 TensorRT FP16",
+}
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "interval_ms": 1000,
@@ -72,6 +87,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "enabled": True,
     },
     "ocr": {
+        "backend": OCR_BACKEND_ONNXRUNTIME,
         "use_cuda": False,
         "use_dml": False,
         "use_cls": False,
@@ -254,6 +270,29 @@ def normalize_bool(value: Any, default: bool) -> bool:
     return default
 
 
+@lru_cache(maxsize=32)
+def _warn_invalid_ocr_backend(value_repr: str) -> None:
+    logging.warning(
+        "ocr.backend=%s 非法；合法值为 %s，已安全回退到 %s",
+        value_repr,
+        ", ".join(OCR_BACKEND_VALUES),
+        OCR_BACKEND_ONNXRUNTIME,
+    )
+
+
+def normalize_ocr_backend(value: Any, warn: bool = True) -> str:
+    if isinstance(value, str) and value in OCR_BACKEND_VALUES:
+        return value
+    if warn:
+        _warn_invalid_ocr_backend(repr(value))
+    return OCR_BACKEND_ONNXRUNTIME
+
+
+def describe_ocr_backend(backend: str) -> str:
+    normalized = normalize_ocr_backend(backend, warn=False)
+    return OCR_BACKEND_LABELS[normalized]
+
+
 def first_present(*values: Any) -> Any:
     for value in values:
         if value is not None:
@@ -366,51 +405,163 @@ class RapidOCREngine:
     def __init__(self) -> None:
         self._engine: Any = None
         self._engine_params: Dict[str, Any] = {}
-        self._import_error_logged = False
+        self._engine_backend: Optional[str] = None
+        self._last_initialization_failure: Optional[
+            Tuple[str, str, str, Optional[str]]
+        ] = None
+        self._nvidia_dll_directories_ready = False
 
     def _build_engine_params(self, config: Dict[str, Any]) -> Dict[str, Any]:
         ocr_config = config.get("ocr", {})
-        return {
-            "EngineConfig.onnxruntime.use_cuda": normalize_bool(
-                ocr_config.get("use_cuda", False), False
+        backend = normalize_ocr_backend(
+            ocr_config.get("backend", OCR_BACKEND_ONNXRUNTIME)
+        )
+        if backend == OCR_BACKEND_ONNXRUNTIME:
+            return {
+                "EngineConfig.onnxruntime.use_cuda": normalize_bool(
+                    ocr_config.get("use_cuda", False), False
+                ),
+                "EngineConfig.onnxruntime.use_dml": normalize_bool(
+                    ocr_config.get("use_dml", False), False
+                ),
+            }
+
+        from rapidocr import EngineType
+
+        engine_params = {
+            "Det.engine_type": EngineType.TENSORRT,
+            "Rec.engine_type": EngineType.TENSORRT,
+            "EngineConfig.tensorrt.use_fp16": (
+                backend == OCR_BACKEND_TENSORRT_FP16
             ),
-            "EngineConfig.onnxruntime.use_dml": normalize_bool(
-                ocr_config.get("use_dml", False), False
-            ),
+            "EngineConfig.tensorrt.use_int8": False,
         }
+        if normalize_bool(ocr_config.get("use_cls", False), False):
+            engine_params["Cls.engine_type"] = EngineType.TENSORRT
+        return engine_params
 
     def _ensure_engine(self, config: Dict[str, Any]) -> bool:
-        engine_params = self._build_engine_params(config)
-        if self._engine is not None and engine_params == self._engine_params:
-            return True
-
         old_engine = self._engine
         old_params = self._engine_params
+        old_backend = self._engine_backend
+        ocr_config = config.get("ocr", {})
+        requested_backend = normalize_ocr_backend(
+            ocr_config.get("backend", OCR_BACKEND_ONNXRUNTIME)
+        )
 
         try:
-            self._preload_onnxruntime_dlls(engine_params)
+            engine_params = self._build_engine_params(config)
+            if (
+                self._engine is not None
+                and requested_backend == self._engine_backend
+                and engine_params == self._engine_params
+            ):
+                self._last_initialization_failure = None
+                return True
+
+            if requested_backend == OCR_BACKEND_ONNXRUNTIME:
+                self._preload_onnxruntime_dlls(engine_params)
+            else:
+                if not self._nvidia_dll_directories_ready:
+                    self._add_nvidia_dll_directories()
+                    self._nvidia_dll_directories_ready = True
+                self._check_tensorrt_dependencies(requested_backend)
+                self._apply_rapidocr_tensorrt_compatibility()
+
             from rapidocr import RapidOCR
 
             if old_engine is not None:
-                logging.info("OCR 引擎配置变化，正在重新初始化 RapidOCR")
+                logging.info(
+                    "OCR 引擎配置变化，正在按用户请求重新初始化：%s",
+                    describe_ocr_backend(requested_backend),
+                )
 
             new_engine = RapidOCR(params=engine_params)
             self._engine = new_engine
             self._engine_params = engine_params
-            logging.info("RapidOCR 初始化完成")
-            self._log_runtime_providers()
+            self._engine_backend = requested_backend
+            self._last_initialization_failure = None
+            logging.info(
+                "RapidOCR 初始化完成；当前实际后端：%s",
+                describe_ocr_backend(requested_backend),
+            )
+            self._log_runtime_backend(
+                requested_backend,
+                normalize_bool(ocr_config.get("use_cls", False), False),
+            )
             return True
-        except Exception:
+        except Exception as exc:
+            failure_key = (
+                requested_backend,
+                repr(locals().get("engine_params", {})),
+                f"{type(exc).__name__}: {exc}",
+                old_backend,
+            )
             if old_engine is not None:
                 self._engine = old_engine
                 self._engine_params = old_params
-                logging.exception("RapidOCR 重新初始化失败，继续使用上一个 OCR 引擎")
+                self._engine_backend = old_backend
+                if failure_key != self._last_initialization_failure:
+                    logging.exception(
+                        "用户请求的 OCR 后端 %s 初始化失败；失败原因：%s；"
+                        "当前继续运行的实际后端：%s",
+                        describe_ocr_backend(requested_backend),
+                        exc,
+                        describe_ocr_backend(old_backend or OCR_BACKEND_ONNXRUNTIME),
+                    )
+                    self._last_initialization_failure = failure_key
                 return True
 
-            if not self._import_error_logged:
-                logging.exception("RapidOCR 初始化失败，将继续运行并发送空框")
-                self._import_error_logged = True
+            if failure_key != self._last_initialization_failure:
+                logging.exception(
+                    "用户请求的 OCR 后端 %s 初始化失败；失败原因：%s；"
+                    "当前继续运行的实际后端：无（OCR 暂不可用，将发送空框）",
+                    describe_ocr_backend(requested_backend),
+                    exc,
+                )
+                self._last_initialization_failure = failure_key
             return False
+
+    def _check_tensorrt_dependencies(self, backend: str) -> None:
+        backend_label = describe_ocr_backend(backend)
+        import_errors: List[str] = []
+        try:
+            import tensorrt  # noqa: F401
+        except Exception as exc:
+            import_errors.append(f"tensorrt ({type(exc).__name__}: {exc})")
+
+        try:
+            from cuda.bindings import runtime as cudart  # noqa: F401
+        except Exception as exc:
+            import_errors.append(
+                f"cuda.bindings.runtime ({type(exc).__name__}: {exc})"
+            )
+
+        if import_errors:
+            raise RuntimeError(
+                f"请求 {backend_label}，但原生 TensorRT 依赖不可用："
+                f"{'; '.join(import_errors)}；请手动安装与 CUDA 12 匹配的 "
+                "tensorrt-cu12 和 cuda-python；程序不会自动安装或伪装为已启用 "
+                "TensorRT"
+            )
+
+    def _apply_rapidocr_tensorrt_compatibility(self) -> None:
+        if importlib_metadata.version("rapidocr") != "3.8.4":
+            return
+
+        from rapidocr.inference_engine.tensorrt import TRTInferSession
+
+        if "model_root_dir" in TRTInferSession.__dict__:
+            return
+
+        # RapidOCR 3.8.4 reads this attribute before assigning the configured
+        # model root. A class-level default restores its intended lazy setup
+        # without changing RapidOCR files or overriding its cache configuration.
+        setattr(TRTInferSession, "model_root_dir", None)
+        logging.warning(
+            "检测到 RapidOCR 3.8.4 原生 TensorRT 的 model_root_dir 初始化缺陷；"
+            "已仅在当前进程应用兼容处理，未修改 RapidOCR 包源码"
+        )
 
     def _preload_onnxruntime_dlls(self, engine_params: Dict[str, Any]) -> None:
         if not (
@@ -483,6 +634,25 @@ class RapidOCREngine:
 
         if providers:
             logging.info("RapidOCR ONNX Runtime providers: %s", providers)
+
+    def _log_runtime_backend(self, backend: str, use_cls: bool) -> None:
+        if backend == OCR_BACKEND_ONNXRUNTIME:
+            self._log_runtime_providers()
+            return
+
+        precision = "FP16" if backend == OCR_BACKEND_TENSORRT_FP16 else "FP32"
+        if use_cls:
+            logging.info(
+                "RapidOCR 原生 TensorRT：精度=%s；实际后端 "
+                "Det=TensorRT、Rec=TensorRT、Cls=TensorRT",
+                precision,
+            )
+        else:
+            logging.info(
+                "RapidOCR 原生 TensorRT：精度=%s；实际后端 "
+                "Det=TensorRT、Rec=TensorRT；Cls 未启用（保持默认 ONNX Runtime）",
+                precision,
+            )
 
     def recognize(self, image: np.ndarray, config: Dict[str, Any]) -> List[OCRItem]:
         if not self._ensure_engine(config):

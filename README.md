@@ -21,11 +21,20 @@ cd D:\SiverKing\VSCode\python\obs_name_ocr
 .\venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-RapidOCR 默认需要 CPU 版 `onnxruntime`，已写入 `requirements.txt`。如果要使用 NVIDIA 显卡加速，请看下面的“NVIDIA 显卡加速”章节。
+RapidOCR 默认需要 CPU 版 `onnxruntime`，已写入 `requirements.txt`。项目同时支持 ONNX Runtime CUDA 和 RapidOCR 原生 TensorRT 两条 NVIDIA 加速路径；TensorRT 是可选依赖，因此没有写入 `requirements.txt`。
 
 ### NVIDIA 显卡加速
 
-默认安装的是 CPU 版 ONNX Runtime。要让 RapidOCR 调用 NVIDIA 显卡，需要换成 GPU 版 `onnxruntime-gpu`，并安装它需要的 CUDA/cuDNN 运行时。
+项目支持两种互斥的 NVIDIA 推理后端：
+
+- `onnxruntime`：继续使用 ONNX Runtime，可通过 `use_cuda` 启用 CUDA provider。
+- `tensorrt_fp32` / `tensorrt_fp16`：使用 RapidOCR 3.8.4 自带的原生 TensorRT 后端。
+
+这里的“原生 TensorRT”不是 ONNX Runtime 的 `TensorrtExecutionProvider`。即使 `ort.get_available_providers()` 列出了该 provider，项目也不会选择它。
+
+#### ONNX Runtime CUDA
+
+默认安装的是 CPU 版 ONNX Runtime。要让 ONNX Runtime 调用 NVIDIA 显卡，需要换成 GPU 版 `onnxruntime-gpu`，并安装它需要的 CUDA/cuDNN 运行时。
 
 先停止 worker，然后执行：
 
@@ -44,13 +53,16 @@ cd D:\SiverKing\VSCode\python\obs_name_ocr
 正常至少应该看到：
 
 ```text
-['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+['CUDAExecutionProvider', 'CPUExecutionProvider']
 ```
+
+列表里额外出现 `TensorrtExecutionProvider` 也没关系；本模式仍只使用 CUDA provider。
 
 然后把 `config.json` 里的 OCR 配置改成：
 
 ```json
 "ocr": {
+  "backend": "onnxruntime",
   "use_cuda": true,
   "use_dml": false,
   "use_cls": false,
@@ -80,6 +92,94 @@ RapidOCR ONNX Runtime providers: {'det': ['CUDAExecutionProvider', 'CPUExecution
 - `CUDAExecutionProvider` 后面仍带着 `CPUExecutionProvider` 是正常的，CPU 是 fallback；只要 provider 列表里 CUDA 在前面，说明会优先走显卡。
 
 实测 2560x1440 原图从数秒级 OCR 降到约 `ocr=470-580ms`。如果仍然慢，优先检查输入分辨率、OBS WebSocket 截图耗时和命中框数量。
+
+#### RapidOCR 原生 TensorRT
+
+本项目支持：
+
+| 配置值 | RapidOCR 后端 | 精度 |
+| --- | --- | --- |
+| `tensorrt_fp32` | Det、Rec 使用 `EngineType.TENSORRT` | FP32，结果与当前 ONNX Runtime 最接近 |
+| `tensorrt_fp16` | Det、Rec 使用 `EngineType.TENSORRT` | FP16，通常更快，阈值附近可能有微小浮点差异 |
+
+当 `use_cls=true` 时，Cls 也切换到 TensorRT；`use_cls=false` 时，未使用的 Cls 保持默认 ONNX Runtime，避免额外构建 Cls Engine。
+
+已实测成功的环境：
+
+- Python `3.12.9`
+- RapidOCR `3.8.4`
+- TensorRT cu12 `10.16.1.11`
+- cuda-python / cuda-bindings `12.9.7`
+- CUDA Runtime `12.9`
+- NVIDIA GeForce RTX 2070 8GB，Compute Capability `7.5`（`sm75`）
+
+停止 worker 后，由用户手动安装可选依赖：
+
+```powershell
+cd D:\SiverKing\VSCode\python\obs_name_ocr
+.\venv\Scripts\python.exe -m pip install "tensorrt-cu12>=10,<11" "cuda-python>=12.9,<13"
+```
+
+不需要卸载当前可用的 RapidOCR、`onnxruntime-gpu` 或 CUDA 12 Python 运行库。安装后做只读导入验证：
+
+```powershell
+.\venv\Scripts\python.exe -m pip check
+.\venv\Scripts\python.exe -c "import tensorrt as trt; from cuda.bindings import runtime as cudart; print('TensorRT:', trt.__version__); print('CUDA Runtime:', cudart.cudaRuntimeGetVersion())"
+.\venv\Scripts\python.exe -c "from rapidocr import EngineType; print(EngineType.TENSORRT, type(EngineType.TENSORRT))"
+```
+
+可以在 GUI 的“OCR 设置”里选择：
+
+- 关闭 TensorRT（ONNX Runtime）
+- TensorRT FP32（准确度优先）
+- TensorRT FP16（速度优先）
+
+也可以直接修改配置：
+
+```json
+"ocr": {
+  "backend": "tensorrt_fp32",
+  "use_cuda": true,
+  "use_dml": false,
+  "use_cls": false,
+  "return_word_box": false,
+  "reload_files_interval_ms": 2000,
+  "log_performance": true,
+  "log_performance_interval_ms": 3000
+}
+```
+
+TensorRT 模式不会使用或传递 `use_cuda` / `use_dml`；GUI 会禁用这两个 ONNX Runtime 专属控件，但不会清空原勾选值，切回 ONNX Runtime 后会恢复。
+
+首次启动会同步构建 Det、Rec Engine。TensorRT 在 `Building TensorRT engine (this may take a few minutes)...` 后可能较长时间没有进度输出，这不是必然卡死。不要提前终止：Engine 只有完整构建成功后才写入磁盘，中断当前阶段后，下次仍会从该阶段重新构建。
+
+RapidOCR 默认把缓存写到：
+
+```text
+venv\Lib\site-packages\rapidocr\models\models\
+```
+
+FP32 和 FP16 使用不同文件，例如：
+
+```text
+ch_PP-OCRv4_det_mobile_sm75_fp32.engine
+ch_PP-OCRv4_rec_mobile_sm75_fp32.engine
+ch_PP-OCRv4_det_mobile_sm75_fp16.engine
+ch_PP-OCRv4_rec_mobile_sm75_fp16.engine
+```
+
+同一模型、GPU 架构和精度再次启动时会直接加载缓存。Engine 不应提交到 Git，也不建议复制到不同 GPU、TensorRT 或 CUDA 环境复用。
+
+TensorRT 常见问题和本次实际踩坑：
+
+- **每次都停在 Building**：通常是上一次在构建完成前手动终止，尚未产生 Engine。让 Det、Rec 至少完整构建一次；TensorRT 不支持断点续编。
+- **FP32 已构建，切换 FP16 又开始 Building**：正常。两种精度使用独立缓存，首次都要分别构建。
+- **`engine_type` 不能传字符串**：RapidOCR 3.8.4 要求 `rapidocr.EngineType.TENSORRT` 枚举。worker 已统一处理，配置文件只填写上述 `backend` 字符串。
+- **`TRTInferSession object has no attribute model_root_dir`**：RapidOCR 3.8.4 原生 TensorRT 初始化顺序缺陷。worker 会仅在当前进程为 3.8.4 应用兼容初始化，不修改 `site-packages`，也不覆盖 RapidOCR 的缓存、workspace 或动态 shape 配置。
+- **缺少 `tensorrt` 或 `cuda.bindings.runtime`**：分别检查 `tensorrt-cu12` 和 `cuda-python`。程序只会输出中文错误，不会自动安装或伪装成 TensorRT 已启用。
+- **把它误认为 ONNX Runtime TensorRT EP**：本项目不使用该 EP。TensorRT 模式由 RapidOCR 的 `TRTInferSession` 直接构建和执行 Engine。
+- **热切换失败**：已有 OCR 引擎仍可用时，worker 会恢复旧引擎，并记录用户请求的后端、失败原因和继续运行的实际后端；首次初始化失败时则发送空框。
+- **源码更新后仅保存配置没有生效**：`config.json` 会热重载，但 Python 源码不会。修改 `worker.py` 后必须重启 worker。
 
 ## 启动桌面 UI
 
@@ -307,6 +407,7 @@ Windows 缩放会让文字和窗口变大，但截图区域仍按实际像素处
 
 ```json
 "ocr": {
+  "backend": "onnxruntime",
   "use_cuda": false,
   "use_dml": false,
   "use_cls": false,
@@ -317,13 +418,16 @@ Windows 缩放会让文字和窗口变大，但截图区域仍按实际像素处
 }
 ```
 
-- `use_cuda`：是否让 RapidOCR 的 ONNX Runtime 优先使用 NVIDIA CUDA。需要安装 GPU 版 `onnxruntime`，并且 provider 列表里出现 `CUDAExecutionProvider` 才会真正生效。
-- `use_dml`：是否使用 Windows DirectML provider。需要安装 `onnxruntime-directml`。如果你是 NVIDIA 显卡，通常优先尝试 `use_cuda`。
+- `backend`：OCR 推理后端。合法值只有 `onnxruntime`、`tensorrt_fp32`、`tensorrt_fp16`。旧配置缺少该字段或填写非法值时会安全回退到 `onnxruntime`；非法值会记录明确警告。
+- `use_cuda`：仅在 `backend=onnxruntime` 时生效。让 RapidOCR 的 ONNX Runtime 优先使用 NVIDIA CUDA；需要安装 GPU 版 `onnxruntime`，并且 provider 列表里出现 `CUDAExecutionProvider`。
+- `use_dml`：仅在 `backend=onnxruntime` 时生效。使用 Windows DirectML provider，需要安装 `onnxruntime-directml`。如果你是 NVIDIA 显卡，通常优先尝试 CUDA。
 - `use_cls`：是否启用文字方向分类。水平文字场景建议 `false`，速度更快。
 - `return_word_box`：是否返回词级框。当前匹配不需要，建议 `false`。
 - `reload_files_interval_ms`：重新读取 `config.json` 和 `name.txt` 的间隔。默认 `2000`。
 - `log_performance`：是否在终端输出每轮耗时，例如截图、OCR、总耗时。
 - `log_performance_interval_ms`：性能日志输出间隔，避免每轮刷屏。
+
+`backend`、TensorRT 精度、TensorRT 模式下的 `use_cls`，以及 ONNX Runtime 的 CUDA/DirectML 参数发生变化时，worker 会按热重载重新初始化 OCR 引擎。FP32 与 FP16 参数不同，因此互相切换一定会重建或加载对应精度的 Engine。
 
 性能优化建议：
 

@@ -17,7 +17,7 @@
       "image_format": "png",
       "image_width": 0,
       "image_height": 0,
-      "image_compression_quality": 100
+      "image_compression_quality": 80
     }
   },
   "match": {
@@ -39,6 +39,7 @@
     "enabled": false
   },
   "ocr": {
+    "backend": "tensorrt_fp16",
     "use_cuda": true,
     "use_dml": false,
     "use_cls": false,
