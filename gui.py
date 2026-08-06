@@ -1,3 +1,6 @@
+# 修改这里即可更新 GUI 显示的版本号
+APP_VERSION = "v11"
+
 import asyncio
 import base64
 import copy
@@ -54,8 +57,18 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 NAME_PATH = BASE_DIR / "name.txt"
 WORKER_PATH = BASE_DIR / "worker.py"
-WORKER_LOG_PATH = BASE_DIR / "worker.log"
-GUI_WORKER_LOG_PATH = BASE_DIR / "gui_worker.log"
+LOG_DIR = BASE_DIR / "logs"
+
+
+def daily_log_path() -> Path:
+    return LOG_DIR / f"{time.strftime('%Y%m%d')}.log"
+
+
+def append_daily_log(message: str) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    with daily_log_path().open("a", encoding="utf-8") as file:
+        file.write(message)
+        file.write("\n")
 
 OCR_BACKEND_ONNXRUNTIME = "onnxruntime"
 OCR_BACKEND_TENSORRT_FP32 = "tensorrt_fp32"
@@ -446,7 +459,7 @@ class SourcePickerDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("OBS Name OCR 控制台")
+        self.setWindowTitle(f"OBS Name OCR 控制台 {APP_VERSION}")
         self.resize(1180, 820)
 
         self.config: Dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
@@ -498,6 +511,10 @@ class MainWindow(QMainWindow):
         title = QLabel("OCR 控制台")
         title.setObjectName("appTitle")
         layout.addWidget(title)
+
+        version_label = QLabel(f"版本 {APP_VERSION}", self)
+        version_label.setObjectName("hint")
+        layout.addWidget(version_label)
         layout.addStretch(1)
 
         self.start_button = QPushButton("启动 worker")
@@ -1328,9 +1345,11 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            self.worker_output_file = GUI_WORKER_LOG_PATH.open("a", encoding="utf-8")
-            self.worker_output_file.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] GUI 启动 worker\n")
-            self.worker_output_file.flush()
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            append_daily_log(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] GUI 启动 worker"
+            )
+            self.worker_output_file = daily_log_path().open("a", encoding="utf-8")
             creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             self.worker_process = subprocess.Popen(
                 [self.choose_python_executable(), str(WORKER_PATH)],
@@ -1384,7 +1403,7 @@ class MainWindow(QMainWindow):
             self.stop_button.setEnabled(False)
 
     def refresh_log(self) -> None:
-        self.log_view.setPlainText(read_tail_lines(WORKER_LOG_PATH, 5))
+        self.log_view.setPlainText(read_tail_lines(daily_log_path(), 5))
         self.log_updated_label.setText(time.strftime("最后刷新 %H:%M:%S"))
 
     def _close_worker_output(self) -> None:

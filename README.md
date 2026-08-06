@@ -2,6 +2,8 @@
 
 这是一个用于 OBS/桌面画面 OCR 命中框显示的 Python 方案。
 
+当前 GUI 版本：`v11`。版本号集中定义在 `gui.py` 顶部的 `APP_VERSION`，修改该常量即可更新窗口标题和工具栏显示。
+
 worker 会读取当前目录的 `name.txt`，按 `config.json` 配置截图并 OCR。命中目标文字后，会通过 WebSocket 推送给 `overlay.html`，也可以按配置开启 Windows 桌面透明覆盖层。
 
 ## 文件说明
@@ -13,6 +15,7 @@ worker 会读取当前目录的 `name.txt`，按 `config.json` 配置截图并 O
 - `config.json`：运行配置。
 - `name.txt`：目标文字列表，每行一个目标。
 - `requirements.txt`：Python 依赖。
+- `logs/YYYYMMDD.log`：运行时按日期生成的统一日志文件（自动创建）。
 
 ## 安装依赖
 
@@ -188,7 +191,9 @@ cd D:\SiverKing\VSCode\python\obs_name_ocr
 .\venv\Scripts\python.exe .\gui.py
 ```
 
-桌面 UI 不需要浏览器页面板。它可以直接编辑 `name.txt`，用中文表单修改 `config.json`，启动或停止 `worker.py`，测试 OBS WebSocket 连接，获取 OBS 场景和输入源并回填 `source_name` / `source_uuid`，底部会自动刷新 `worker.log` 最近 5 行。
+桌面 UI 不需要浏览器页面板。它可以直接编辑 `name.txt`，用中文表单修改 `config.json`，启动或停止 `worker.py`，测试 OBS WebSocket 连接，获取 OBS 场景和输入源并回填 `source_name` / `source_uuid`，底部会自动刷新运行目录 `logs/YYYYMMDD.log` 的最近 5 行。
+
+worker、GUI 启动的子进程输出以及 OBS 脚本启动的 worker 输出统一写入运行目录的 `logs` 文件夹，并按本地日期生成文件，例如 `logs/20260806.log`。
 
 如果没有使用项目自带虚拟环境，也可以用当前 Python 运行：
 
@@ -202,6 +207,8 @@ python .\gui.py
 cd D:\SiverKing\VSCode\python\obs_name_ocr
 .\venv\Scripts\python.exe .\worker.py
 ```
+
+运行日志会写入当前目录的 `logs/YYYYMMDD.log`，例如 `logs/20260806.log`；跨日期运行时 worker 日志会切换到当天文件。
 
 停止时按 `Ctrl+C`。如果终端仍未释放，可用下面命令查占用端口的 PID：
 

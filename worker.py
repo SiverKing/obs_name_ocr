@@ -12,6 +12,7 @@ import queue
 import signal
 import site
 import struct
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -29,7 +30,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 NAME_PATH = BASE_DIR / "name.txt"
 OVERLAY_PATH = BASE_DIR / "overlay.html"
-LOG_PATH = BASE_DIR / "worker.log"
+LOG_DIR = BASE_DIR / "logs"
 OCR_OUTPUT_PATH = BASE_DIR / "ocr_output.txt"
 
 OCR_BACKEND_ONNXRUNTIME = "onnxruntime"
@@ -133,15 +134,70 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 FORCE_EXIT_TIMER: Optional[threading.Timer] = None
 
 
+class DailyFileHandler(logging.Handler):
+    """按日志记录日期写入 logs/YYYYMMDD.log。"""
+
+    def __init__(self, log_dir: Path) -> None:
+        super().__init__()
+        self.log_dir = log_dir
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            date_name = time.strftime("%Y%m%d", time.localtime(record.created))
+            log_path = self.log_dir / f"{date_name}.log"
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as file:
+                file.write(self.format(record))
+                file.write("\n")
+        except Exception:
+            self.handleError(record)
+
+
+def _terminal_logging_enabled() -> bool:
+    try:
+        return bool(sys.stderr and sys.stderr.isatty())
+    except Exception:
+        return False
+
+
 def setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(LOG_PATH, encoding="utf-8"),
-        ],
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    file_handler = DailyFileHandler(LOG_DIR)
+    file_handler.setFormatter(formatter)
+    handlers: List[logging.Handler] = [file_handler]
+    if _terminal_logging_enabled():
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        handlers.insert(0, stream_handler)
+    logging.basicConfig(level=logging.INFO, handlers=handlers)
+
+
+def _configure_rapidocr_logging() -> None:
+    rapidocr_logger = logging.getLogger("RapidOCR")
+    daily_handler = next(
+        (
+            handler
+            for handler in rapidocr_logger.handlers
+            if getattr(handler, "_obs_name_ocr_daily", False)
+        ),
+        None,
     )
+    if daily_handler is None:
+        daily_handler = DailyFileHandler(LOG_DIR)
+        daily_handler._obs_name_ocr_daily = True
+        daily_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] [RapidOCR] %(message)s")
+        )
+        rapidocr_logger.addHandler(daily_handler)
+
+    if not _terminal_logging_enabled():
+        for handler in list(rapidocr_logger.handlers):
+            if handler is daily_handler:
+                continue
+            rapidocr_logger.removeHandler(handler)
+            handler.close()
+    rapidocr_logger.propagate = False
 
 
 def deep_merge(defaults: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
@@ -469,6 +525,7 @@ class RapidOCREngine:
                 self._apply_rapidocr_tensorrt_compatibility()
 
             from rapidocr import RapidOCR
+            _configure_rapidocr_logging()
 
             if old_engine is not None:
                 logging.info(
