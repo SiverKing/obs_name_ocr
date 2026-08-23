@@ -1,3 +1,4 @@
+# 版权所有 © 2026 www.siver.top
 # 修改这里即可更新 GUI 显示的版本号
 APP_VERSION = "v11"
 
@@ -515,6 +516,15 @@ class MainWindow(QMainWindow):
         version_label = QLabel(f"版本 {APP_VERSION}", self)
         version_label.setObjectName("hint")
         layout.addWidget(version_label)
+
+        copyright_label = QLabel(
+            '版权所有 <a href="https://www.siver.top" style="color:#2563eb;">www.siver.top</a>',
+            self,
+        )
+        copyright_label.setObjectName("hint")
+        copyright_label.setOpenExternalLinks(True)
+        copyright_label.setToolTip("https://www.siver.top")
+        layout.addWidget(copyright_label)
         layout.addStretch(1)
 
         self.start_button = QPushButton("启动 worker")

@@ -632,3 +632,7 @@ OBS 浏览器源：
 `source_uuid` 优先级高于 `source_name`。如果 OBS 里重命名了来源但 UUID 没变，保留 UUID 通常更稳定。
 
 OBS WebSocket 截图适合 500ms 到数秒级的 OCR 轮询，不是高帧率实时帧流。频率太高时，优先降低 `interval_ms` 的压力、降低 `image_width/image_height`，或改用 `jpg` 并适当调低 `image_compression_quality`。
+
+---
+
+版权所有 © 2026 [www.siver.top](https://www.siver.top)

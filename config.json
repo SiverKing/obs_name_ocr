@@ -1,5 +1,5 @@
 {
-  "interval_ms": 500,
+  "interval_ms": 300,
   "host": "0.0.0.0",
   "port": 8765,
   "capture": {
@@ -14,7 +14,7 @@
       "password": "",
       "source_name": "窗口采集",
       "source_uuid": "0bff0c8b-4869-478a-ad97-f8f5c6e23568",
-      "image_format": "png",
+      "image_format": "jpg",
       "image_width": 0,
       "image_height": 0,
       "image_compression_quality": 80

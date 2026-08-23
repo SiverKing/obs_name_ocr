@@ -1,3 +1,4 @@
+# 版权所有 © 2026 www.siver.top
 import ctypes
 from ctypes import wintypes
 

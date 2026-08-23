@@ -1,3 +1,4 @@
+# 版权所有 © 2026 www.siver.top
 import asyncio
 import base64
 import colorsys
