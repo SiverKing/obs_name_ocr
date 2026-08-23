@@ -1,6 +1,6 @@
 # 版权所有 © 2026 www.siver.top
 # 修改这里即可更新 GUI 显示的版本号
-APP_VERSION = "v11"
+APP_VERSION = "v12"
 
 import asyncio
 import base64

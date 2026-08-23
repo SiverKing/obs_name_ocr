@@ -1991,18 +1991,18 @@ def generate_distinct_colors(count: int) -> Tuple[str, ...]:
                 seen_candidates.add(rgb)
                 candidates.append(rgb)
 
-    selected: List[Tuple[int, int, int]] = [(242, 48, 48)]
-    remaining = [candidate for candidate in candidates if candidate != selected[0]]
-    while len(selected) < count and remaining:
-        best = max(
-            remaining,
-            key=lambda candidate: (
-                min(rgb_distance_squared(candidate, current) for current in selected),
-                sum(candidate),
-            ),
-        )
-        selected.append(best)
-        remaining.remove(best)
+    first = (242, 48, 48)
+    remaining = np.asarray(
+        [candidate for candidate in candidates if candidate != first],
+        dtype=np.int64,
+    )
+    selected = [first]
+    while len(selected) < count and len(remaining) > 0:
+        deltas = remaining[:, None, :] - np.asarray(selected, dtype=np.int64)[None, :, :]
+        min_distance = np.sum(deltas * deltas, axis=-1).min(axis=1)
+        best_index = int(np.argmax(min_distance * 1000 + np.sum(remaining, axis=1)))
+        selected.append(tuple(int(channel) for channel in remaining[best_index]))
+        remaining = np.delete(remaining, best_index, axis=0)
 
     golden_ratio = 0.618033988749895
     while len(selected) < count:
