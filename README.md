@@ -1,26 +1,78 @@
 # OBS Name OCR
 
-这是一个用于 OBS/桌面画面 OCR 命中框显示的 Python 方案。
+<div align="center">
+
+用于 OBS / 桌面画面 OCR 命中框显示的 Python 方案：截图 → OCR 识别 → 匹配 `name.txt` 目标文字 → 在 OBS 浏览器源或桌面透明覆盖层上实时画框。
+
+[![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/Platform-Windows-0078d6?logo=windows&logoColor=white)](#)
+[![GUI](https://img.shields.io/badge/GUI-v11-6b7280)](#)
+
+</div>
 
 当前 GUI 版本：`v11`。版本号集中定义在 `gui.py` 顶部的 `APP_VERSION`，修改该常量即可更新窗口标题和工具栏显示。
 
 worker 会读取当前目录的 `name.txt`，按 `config.json` 配置截图并 OCR。命中目标文字后，会通过 WebSocket 推送给 `overlay.html`，也可以按配置开启 Windows 桌面透明覆盖层。
 
+## 目录
+
+- [快速开始](#快速开始)
+- [文件说明](#文件说明)
+- [安装依赖](#安装依赖)
+  - [NVIDIA 显卡加速](#nvidia-显卡加速)
+- [启动桌面 UI](#启动桌面-ui)
+- [启动 worker](#启动-worker)
+- [目标文字 name.txt](#目标文字-nametxt)
+- [配置参数 config.json](#配置参数-configjson)
+  - [基础服务](#基础服务)
+  - [截图区域 capture](#截图区域-capture)
+  - [Windows 分辨率和缩放](#windows-分辨率和缩放)
+  - [匹配规则 match](#匹配规则-match)
+  - [匹配容错 match_tolerance](#匹配容错-match_tolerance)
+  - [OCR 原始输出 ocr_output](#ocr-原始输出-ocr_output)
+  - [OCR 性能 ocr](#ocr-性能-ocr)
+  - [画框样式 overlay](#画框样式-overlay)
+  - [桌面透明覆盖层 desktop_overlay](#桌面透明覆盖层-desktop_overlay)
+  - [OBS 源和桌面坐标偏移](#obs-源和桌面坐标偏移)
+- [OBS 浏览器源用法](#obs-浏览器源用法)
+- [桌面透明层和 OBS 浏览器源的区别](#桌面透明层和-obs-浏览器源的区别)
+- [OBS 捕获源选择](#obs-捕获源选择)
+- [版权声明](#版权声明)
+
+## 快速开始
+
+```powershell
+# 安装依赖
+python -m pip install -r requirements.txt
+
+# 启动桌面 UI
+python .\gui.py
+
+# 或直接启动 worker（无 UI）
+python .\worker.py
+```
+
+- `config.json`：不存在时 worker 会自动创建默认配置；`name.txt` 不存在时按空目标列表处理，在 GUI 里点“保存”即可生成。
+- 日志统一写入 `logs/YYYYMMDD.log`，跨日期自动切换当天文件。
+
 ## 文件说明
 
-- `worker.py`：OCR worker，负责截图、识别、匹配、HTTP/WebSocket 服务和可选桌面透明覆盖层。
-- `gui.py`：本地桌面 UI，用于编辑 `name.txt`、修改 `config.json`、启动/停止 worker、测试 OBS WebSocket 和查看最近日志。
-- `overlay.html`：OBS 浏览器源使用的透明 canvas 画框页面。
-- `obs_name_ocr.py`：OBS Python 脚本，只负责启动/停止 worker。
-- `config.json`：运行配置。
-- `name.txt`：目标文字列表，每行一个目标。
-- `requirements.txt`：Python 依赖。
-- `logs/YYYYMMDD.log`：运行时按日期生成的统一日志文件（自动创建）。
+| 文件 | 说明 |
+| --- | --- |
+| `worker.py` | OCR worker，负责截图、识别、匹配、HTTP/WebSocket 服务和可选桌面透明覆盖层 |
+| `gui.py` | 本地桌面 UI，用于编辑 `name.txt`、修改 `config.json`、启动/停止 worker、测试 OBS WebSocket 和查看最近日志 |
+| `overlay.html` | OBS 浏览器源使用的透明 canvas 画框页面 |
+| `config.json` | 运行配置（不存在时自动创建） |
+| `name.txt` | 目标文字列表，每行一个目标 |
+| `requirements.txt` | Python 依赖 |
+| `list_obs_sources.py` | 辅助脚本：列出 OBS 场景、输入源和 UUID |
+| `list_windows.py` | 辅助脚本：列出当前 Windows 可见窗口，用于排查桌面覆盖层坐标 |
+| `start.bat` | 一键启动桌面 UI 的批处理 |
+| `logs/YYYYMMDD.log` | 运行时按日期生成的统一日志文件（自动创建） |
 
 ## 安装依赖
 
 ```powershell
-cd D:\SiverKing\VSCode\python\obs_name_ocr
 .\venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
@@ -42,7 +94,6 @@ RapidOCR 默认需要 CPU 版 `onnxruntime`，已写入 `requirements.txt`。项
 先停止 worker，然后执行：
 
 ```powershell
-cd D:\SiverKing\VSCode\python\obs_name_ocr
 .\venv\Scripts\python.exe -m pip uninstall -y onnxruntime onnxruntime-gpu onnxruntime-directml
 .\venv\Scripts\python.exe -m pip install --upgrade "onnxruntime-gpu[cuda,cudnn]"
 ```
@@ -119,7 +170,6 @@ RapidOCR ONNX Runtime providers: {'det': ['CUDAExecutionProvider', 'CPUExecution
 停止 worker 后，由用户手动安装可选依赖：
 
 ```powershell
-cd D:\SiverKing\VSCode\python\obs_name_ocr
 .\venv\Scripts\python.exe -m pip install "tensorrt-cu12>=10,<11" "cuda-python>=12.9,<13"
 ```
 
@@ -187,7 +237,6 @@ TensorRT 常见问题和本次实际踩坑：
 ## 启动桌面 UI
 
 ```powershell
-cd D:\SiverKing\VSCode\python\obs_name_ocr
 .\venv\Scripts\python.exe .\gui.py
 ```
 
@@ -204,7 +253,6 @@ python .\gui.py
 ## 启动 worker
 
 ```powershell
-cd D:\SiverKing\VSCode\python\obs_name_ocr
 .\venv\Scripts\python.exe .\worker.py
 ```
 
@@ -217,7 +265,7 @@ netstat -ano | findstr :8765
 taskkill /PID 进程号 /F
 ```
 
-## name.txt
+## 目标文字 name.txt
 
 规则：
 
@@ -238,7 +286,7 @@ taskkill /PID 进程号 /F
 某个ID
 ```
 
-## config.json 参数
+## 配置参数 config.json
 
 ### 基础服务
 
@@ -633,6 +681,6 @@ OBS 浏览器源：
 
 OBS WebSocket 截图适合 500ms 到数秒级的 OCR 轮询，不是高帧率实时帧流。频率太高时，优先降低 `interval_ms` 的压力、降低 `image_width/image_height`，或改用 `jpg` 并适当调低 `image_compression_quality`。
 
----
+## 版权声明
 
 版权所有 © 2026 [www.siver.top](https://www.siver.top)
