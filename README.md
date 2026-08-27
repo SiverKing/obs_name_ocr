@@ -10,34 +10,38 @@
 
 </div>
 
-当前 GUI 版本：`v11`。版本号集中定义在 `gui.py` 顶部的 `APP_VERSION`，修改该常量即可更新窗口标题和工具栏显示。
+当前 GUI 版本：`v13`。版本号集中定义在 `gui.py` 顶部的 `APP_VERSION`，修改该常量即可更新窗口标题和工具栏显示。
 
 worker 会读取当前目录的 `name.txt`，按 `config.json` 配置截图并 OCR。命中目标文字后，会通过 WebSocket 推送给 `overlay.html`，也可以按配置开启 Windows 桌面透明覆盖层。
 
 ## 目录
 
-- [快速开始](#快速开始)
-- [文件说明](#文件说明)
-- [安装依赖](#安装依赖)
-  - [NVIDIA 显卡加速](#nvidia-显卡加速)
-- [启动桌面 UI](#启动桌面-ui)
-- [启动 worker](#启动-worker)
-- [目标文字 name.txt](#目标文字-nametxt)
-- [配置参数 config.json](#配置参数-configjson)
-  - [基础服务](#基础服务)
-  - [截图区域 capture](#截图区域-capture)
-  - [Windows 分辨率和缩放](#windows-分辨率和缩放)
-  - [匹配规则 match](#匹配规则-match)
-  - [匹配容错 match_tolerance](#匹配容错-match_tolerance)
-  - [OCR 原始输出 ocr_output](#ocr-原始输出-ocr_output)
-  - [OCR 性能 ocr](#ocr-性能-ocr)
-  - [画框样式 overlay](#画框样式-overlay)
-  - [桌面透明覆盖层 desktop_overlay](#桌面透明覆盖层-desktop_overlay)
-  - [OBS 源和桌面坐标偏移](#obs-源和桌面坐标偏移)
-- [OBS 浏览器源用法](#obs-浏览器源用法)
-- [桌面透明层和 OBS 浏览器源的区别](#桌面透明层和-obs-浏览器源的区别)
-- [OBS 捕获源选择](#obs-捕获源选择)
-- [版权声明](#版权声明)
+- [OBS Name OCR](#obs-name-ocr)
+  - [目录](#目录)
+  - [快速开始](#快速开始)
+  - [文件说明](#文件说明)
+  - [安装依赖](#安装依赖)
+    - [NVIDIA 显卡加速](#nvidia-显卡加速)
+      - [ONNX Runtime CUDA](#onnx-runtime-cuda)
+      - [RapidOCR 原生 TensorRT](#rapidocr-原生-tensorrt)
+  - [启动桌面 UI](#启动桌面-ui)
+  - [启动 worker](#启动-worker)
+  - [目标文字 name.txt](#目标文字-nametxt)
+  - [配置参数 config.json](#配置参数-configjson)
+    - [基础服务](#基础服务)
+    - [截图区域 capture](#截图区域-capture)
+    - [Windows 分辨率和缩放](#windows-分辨率和缩放)
+    - [匹配规则 match](#匹配规则-match)
+    - [匹配容错 match\_tolerance](#匹配容错-match_tolerance)
+    - [OCR 原始输出 ocr\_output](#ocr-原始输出-ocr_output)
+    - [OCR 性能 ocr](#ocr-性能-ocr)
+    - [画框样式 overlay](#画框样式-overlay)
+    - [桌面透明覆盖层 desktop\_overlay](#桌面透明覆盖层-desktop_overlay)
+    - [OBS 源和桌面坐标偏移](#obs-源和桌面坐标偏移)
+  - [OBS 浏览器源用法](#obs-浏览器源用法)
+  - [桌面透明层和 OBS 浏览器源的区别](#桌面透明层和-obs-浏览器源的区别)
+  - [OBS 捕获源选择](#obs-捕获源选择)
+  - [版权声明](#版权声明)
 
 ## 快速开始
 
