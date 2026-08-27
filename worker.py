@@ -1824,10 +1824,17 @@ def collapse_repeated_chars(text: str) -> str:
     if not text:
         return text
 
-    result = [text[0]]
+    result: List[str] = []
+    run_char = text[0]
+    run_length = 1
     for char in text[1:]:
-        if char != result[-1]:
-            result.append(char)
+        if char == run_char:
+            run_length += 1
+            continue
+        result.append(run_char if run_length <= 3 else run_char * run_length)
+        run_char = char
+        run_length = 1
+    result.append(run_char if run_length <= 3 else run_char * run_length)
     return "".join(result)
 
 

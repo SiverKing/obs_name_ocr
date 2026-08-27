@@ -1,7 +1,7 @@
 {
   "interval_ms": 300,
   "host": "0.0.0.0",
-  "port": 8765,
+  "port": 8766,
   "capture": {
     "source": "obs_websocket",
     "monitor": 1,
