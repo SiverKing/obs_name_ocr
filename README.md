@@ -6,7 +6,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078d6?logo=windows&logoColor=white)](#)
-[![GUI](https://img.shields.io/badge/GUI-v11-6b7280)](#)
+[![GUI](https://img.shields.io/badge/GUI-v13-6b7280)](#)
 
 </div>
 
@@ -175,6 +175,9 @@ RapidOCR ONNX Runtime providers: {'det': ['CUDAExecutionProvider', 'CPUExecution
 
 ```powershell
 .\venv\Scripts\python.exe -m pip install "tensorrt-cu12>=10,<11" "cuda-python>=12.9,<13"
+```
+```powershell # 大陆镜像源
+.\venv\Scripts\python.exe -m pip install "tensorrt-cu12>=10,<11" "cuda-python>=12.9,<13" -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple --extra-index-url https://pypi.nvidia.cn/
 ```
 
 不需要卸载当前可用的 RapidOCR、`onnxruntime-gpu` 或 CUDA 12 Python 运行库。安装后做只读导入验证：

@@ -12,4 +12,5 @@ ocr_output.txt
 venv/
 dist/
 build
+logs/
 
