@@ -6,11 +6,11 @@
 
 [![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078d6?logo=windows&logoColor=white)](#)
-[![GUI](https://img.shields.io/badge/GUI-v13-6b7280)](#)
+[![GUI](https://img.shields.io/badge/GUI-v14-6b7280)](#)
 
 </div>
 
-当前 GUI 版本：`v13`。版本号集中定义在 `gui.py` 顶部的 `APP_VERSION`，修改该常量即可更新窗口标题和工具栏显示。
+当前 GUI 版本：`v14`。版本号集中定义在 `gui.py` 顶部的 `APP_VERSION`，修改该常量即可更新窗口标题和工具栏显示。
 
 worker 会读取当前目录的 `name.txt`，按 `config.json` 配置截图并 OCR。命中目标文字后，会通过 WebSocket 推送给 `overlay.html`，也可以按配置开启 Windows 桌面透明覆盖层。
 
@@ -27,6 +27,7 @@ worker 会读取当前目录的 `name.txt`，按 `config.json` 配置截图并 O
   - [启动桌面 UI](#启动桌面-ui)
   - [启动 worker](#启动-worker)
   - [目标文字 name.txt](#目标文字-nametxt)
+    - [分组特效](#分组特效)
   - [配置参数 config.json](#配置参数-configjson)
     - [基础服务](#基础服务)
     - [截图区域 capture](#截图区域-capture)
@@ -247,7 +248,7 @@ TensorRT 常见问题和本次实际踩坑：
 .\venv\Scripts\python.exe .\gui.py
 ```
 
-桌面 UI 不需要浏览器页面板。它可以直接编辑 `name.txt`，用中文表单修改 `config.json`，启动或停止 `worker.py`，测试 OBS WebSocket 连接，获取 OBS 场景和输入源并回填 `source_name` / `source_uuid`，底部会自动刷新运行目录 `logs/YYYYMMDD.log` 的最近 5 行。
+桌面 UI 不需要浏览器页面板。它可以直接编辑 `name.txt`，用中文表单修改 `config.json`，启动或停止 `worker.py`，测试 OBS WebSocket 连接，获取 OBS 场景和输入源并回填 `source_name` / `source_uuid`，底部会自动刷新运行目录 `logs/YYYYMMDD.log` 的最近 5 行。`name.txt` 面板还提供「特效说明」按钮，弹出各分组特效后缀的速查表。
 
 worker、GUI 启动的子进程输出以及 OBS 脚本启动的 worker 输出统一写入运行目录的 `logs` 文件夹，并按本地日期生成文件，例如 `logs/20260806.log`。
 
@@ -280,8 +281,24 @@ taskkill /PID 进程号 /F
 - 每行一个目标。
 - 空行会被忽略。
 - `#` 开头的行是分组标签；目标使用它上方最近的分组。
-- 有分组时，识别框标签显示为 `分组-目标`；没有分组时仍显示原目标名。
+- 有分组时，识别框标签显示为 `分组：目标 - 百分比`；没有分组时显示 `目标 - 百分比`。
+- 百分比是“识别到该 ID 的可信度”：由 OCR 识别置信度和匹配证据（原始/归一化/编辑距离/相似度档位、目标覆盖率）加权融合后取整，最高封顶 `99%`，与 `match.min_confidence` 不是同一个数值。
 - worker 会运行中反复读取，改完文件后不需要重启。
+
+### 分组特效
+
+给分组表头加后缀即可让该组全部目标使用动效框，例如 `# 黑名单#R`。后缀大小写不敏感；`#R` 前面的基础名才是标签里显示的分组名；不带后缀的分组保持默认自动分色；同一目标重复出现时，以第一次出现的分组和特效为准。OBS 浏览器源和桌面透明层都支持这些特效。
+
+| 后缀 | 特效 | 效果 |
+| --- | --- | --- |
+| `#R` | rainbow 彩虹流光 | 彩虹沿边框流动，约 2 秒一圈；桌面层标签为彩虹底色白字描边 |
+| `#F` | flash 红白闪烁 | 边框与标签在红、白之间交替闪烁，每秒 2 次 |
+| `#P` | pulse 呼吸脉冲 | 边框亮度按 1.2 秒周期在 55% ~ 100% 之间呼吸 |
+| `#M` | march 黄黑警戒 | 黄黑相间的警戒段沿边框滚动，像跑马灯 |
+| `#N` | neon 霓虹光晕 | 保留自动分色，边框外圈同色柔光按 1.6 秒周期呼吸 |
+| `#D` | duotone 双色渐变 | 青色 `#00c7be` 与紫色 `#af52de` 沿边框循环流动 |
+
+GUI 里 `name.txt` 面板的「特效说明」按钮可以随时查看这张表。
 
 示例：
 
@@ -289,8 +306,10 @@ taskkill /PID 进程号 /F
 # 管理员
 张三
 目标玩家
-# 黑名单
+# 黑名单#R
 某个ID
+# 挂#F
+另一个ID
 ```
 
 ## 配置参数 config.json
@@ -427,7 +446,7 @@ Windows 缩放会让文字和窗口变大，但截图区域仍按实际像素处
   - `contains`：OCR 结果包含目标文字就算命中，推荐默认值。
   - `exact`：OCR 结果必须和目标完全一致。
 - `case_sensitive`：是否大小写敏感。
-- `min_confidence`：最低 OCR 置信度。漏识别可降到 `0.3`，误框多可升到 `0.7`。
+- `min_confidence`：最低 OCR 置信度，匹配前先用它过滤识别结果。漏识别可降到 `0.3`，误框多可升到 `0.7`。识别框标签里的百分比是融合后的可信度，和这个过滤阈值不是同一个数值。
 
 ### 匹配容错 match_tolerance
 
@@ -527,6 +546,8 @@ Windows 缩放会让文字和窗口变大，但截图区域仍按实际像素处
 - `line_width`：框线宽度。
 - `show_label`：是否显示命中的文字标签。
 
+命中目标属于带特效的分组（`#R/#F/#P/#M/#N/#D`）时，框和标签优先按特效绘制；只有普通分组使用上面的颜色配置。
+
 这个配置同时影响 OBS 浏览器源和桌面透明覆盖层。
 
 ### 桌面透明覆盖层 desktop_overlay
@@ -561,6 +582,8 @@ Windows 缩放会让文字和窗口变大，但截图区域仍按实际像素处
 - `screen_region`：当 `coordinate_mode` 为 `screen_region` 时使用。可以填 `"auto"` 自动获取，或者手动填写目标画面在 Windows 屏幕上的实际位置和大小。
 - `topmost`：是否置顶。建议 `true`。
 - `transparent_color`：透明背景色。保持默认即可，除非你的画面正好需要显示这个颜色。
+
+桌面透明层同样支持分组特效（`#R/#F/#P/#M/#N/#D`）：动画刷新上限 30fps，只重绘动效框及其标签区域；没有动效框时开销与旧版一致。
 
 如果你想让红框直接显示在自己的屏幕上，打开：
 

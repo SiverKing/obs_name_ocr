@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import queue
 import signal
@@ -47,6 +48,10 @@ OCR_BACKEND_LABELS = {
     OCR_BACKEND_TENSORRT_FP32: "RapidOCR 原生 TensorRT FP32",
     OCR_BACKEND_TENSORRT_FP16: "RapidOCR 原生 TensorRT FP16",
 }
+
+OCR_CONF_WEIGHT = 0.4
+MATCH_CONF_WEIGHT = 0.6
+MAX_FUSED_CONFIDENCE = 0.99
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "interval_ms": 1000,
@@ -274,45 +279,73 @@ def save_config_port(port: int, previous_port: int) -> None:
         logging.exception("写入 config.json 端口失败，请手动把 port 改为 %s", port)
 
 
-def parse_targets(content: str) -> Tuple[List[str], Dict[str, str]]:
+GROUP_STYLE_SUFFIXES = {
+    "R": "rainbow",
+    "F": "flash",
+    "P": "pulse",
+    "M": "march",
+    "N": "neon",
+    "D": "duotone",
+}
+ANIMATED_STYLES = frozenset(GROUP_STYLE_SUFFIXES.values())
+
+
+def parse_targets(content: str) -> Tuple[List[str], Dict[str, str], Dict[str, str]]:
     targets: List[str] = []
     target_groups: Dict[str, str] = {}
+    target_styles: Dict[str, str] = {}
     current_group = ""
+    current_style = ""
 
     for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line:
             continue
         if line.startswith("#"):
-            current_group = line[1:].strip()
+            header = line[1:].strip()
+            group_name, sep, suffix = header.rpartition("#")
+            style = GROUP_STYLE_SUFFIXES.get(suffix.strip().upper(), "") if sep else ""
+            if style and group_name.strip():
+                current_group = group_name.strip()
+                current_style = style
+            else:
+                current_group = header
+                current_style = ""
             continue
 
         targets.append(line)
         # 匹配按 name.txt 顺序取第一个目标，重复目标的分组也保持相同规则。
         target_groups.setdefault(line.casefold(), current_group)
+        target_styles.setdefault(line.casefold(), current_style)
 
-    return targets, target_groups
+    return targets, target_groups, target_styles
 
 
-def read_targets_and_groups() -> Tuple[List[str], Dict[str, str]]:
+def read_targets_and_groups() -> Tuple[List[str], Dict[str, str], Dict[str, str]]:
     if not NAME_PATH.exists():
-        return [], {}
+        return [], {}, {}
 
     try:
         return parse_targets(NAME_PATH.read_text(encoding="utf-8"))
     except Exception:
         logging.exception("读取 name.txt 失败，当前轮使用空目标列表")
-        return [], {}
+        return [], {}, {}
 
 
 def read_targets() -> List[str]:
-    targets, _ = read_targets_and_groups()
+    targets, _, _ = read_targets_and_groups()
     return targets
 
 
-def build_target_label(target: str, target_groups: Dict[str, str]) -> str:
+def build_target_label(
+    target: str,
+    target_groups: Dict[str, str],
+    confidence: float = 1.0,
+) -> str:
     group = target_groups.get(str(target).casefold(), "")
-    return f"{group}-{target}" if group else target
+    percent = int(round(float(confidence) * 100))
+    label = f"{target} - {percent}%"
+    return f"{group}：{label}" if group else label
 
 
 def normalize_bool(value: Any, default: bool) -> bool:
@@ -447,6 +480,7 @@ class MatchResult:
     target: str
     method: str
     score: float = 1.0
+    kind: str = "raw"
 
 
 @dataclass
@@ -1131,10 +1165,25 @@ class DesktopOverlay:
         PM_REMOVE = 0x0001
         PS_SOLID = 0
         NULL_BRUSH = 5
+        NULL_PEN = 8
         TRANSPARENT = 1
         DT_LEFT = 0x00000000
         DT_TOP = 0x00000000
         DT_SINGLELINE = 0x00000020
+        DT_CALCRECT = 0x00000400
+        FLASH_HZ = 2.0
+        RAINBOW_SPEED = 0.5
+        RAINBOW_DIRECTION = 1
+        RAINBOW_STEPS = 120
+        RAINBOW_SEGMENTS = 96
+        PULSE_PERIOD = 1.2
+        NEON_PERIOD = 1.6
+        MARCH_SPEED = 40.0
+        MARCH_SEGMENT = 8
+        DUOTONE_SPEED = 0.1
+        DUOTONE_COLORS = ("#00c7be", "#af52de")
+        MARCH_COLORS = ("#ffcc00", "#1a1a1a")
+        ANIM_INTERVAL = 1.0 / 30.0
 
         class RECT(ctypes.Structure):
             _fields_ = [
@@ -1233,6 +1282,31 @@ class DesktopOverlay:
         gdi32.Rectangle.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
         gdi32.SetBkMode.argtypes = [wintypes.HDC, ctypes.c_int]
         gdi32.SetTextColor.argtypes = [wintypes.HDC, wintypes.COLORREF]
+        gdi32.MoveToEx.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        gdi32.MoveToEx.restype = wintypes.BOOL
+        gdi32.LineTo.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+        gdi32.LineTo.restype = wintypes.BOOL
+        user32.GetDC.argtypes = [wintypes.HWND]
+        user32.GetDC.restype = wintypes.HDC
+        user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+        user32.ReleaseDC.restype = ctypes.c_int
+        gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+        gdi32.CreateCompatibleDC.restype = wintypes.HDC
+        gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+        gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+        gdi32.DeleteDC.argtypes = [wintypes.HDC]
+        gdi32.BitBlt.argtypes = [
+            wintypes.HDC,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.HDC,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.DWORD,
+        ]
+        gdi32.BitBlt.restype = wintypes.BOOL
 
         def colorref(value: Any, fallback: str = "#ff3b30") -> int:
             text = str(value or fallback).strip()
@@ -1253,6 +1327,243 @@ class DesktopOverlay:
             boxes = message.get("boxes") if isinstance(message, dict) else []
             return boxes if isinstance(boxes, list) else []
 
+        pen_cache: Dict[Tuple[int, int], Any] = {}
+        brush_cache: Dict[int, Any] = {}
+
+        def get_pen(color_value: int, width_value: int) -> Any:
+            key = (color_value, width_value)
+            cached = pen_cache.get(key)
+            if cached is None:
+                cached = gdi32.CreatePen(PS_SOLID, width_value, color_value)
+                pen_cache[key] = cached
+            return cached
+
+        def hue_pen(hue: float, width_value: int) -> Any:
+            quantized = round((hue % 1.0) * RAINBOW_STEPS) / RAINBOW_STEPS % 1.0
+            red, green, blue = colorsys.hsv_to_rgb(quantized, 1.0, 1.0)
+            color = int(round(red * 255)) | (int(round(green * 255)) << 8) | (int(round(blue * 255)) << 16)
+            return get_pen(color, width_value)
+
+        def hue_brush(hue: float) -> Any:
+            quantized = round((hue % 1.0) * RAINBOW_STEPS) / RAINBOW_STEPS % 1.0
+            red, green, blue = colorsys.hsv_to_rgb(quantized, 1.0, 1.0)
+            color = int(round(red * 255)) | (int(round(green * 255)) << 8) | (int(round(blue * 255)) << 16)
+            cached = brush_cache.get(color)
+            if cached is None:
+                cached = gdi32.CreateSolidBrush(color)
+                brush_cache[color] = cached
+            return cached
+
+        def draw_rainbow_label(hdc: Any, rect: Any, now: float) -> None:
+            width = rect.right - rect.left
+            if width <= 0 or rect.bottom <= rect.top:
+                return
+            offset = RAINBOW_DIRECTION * now * RAINBOW_SPEED
+            step = max(2, int(round(width / 48)))
+            left = rect.left
+            while left < rect.right:
+                right = min(rect.right, left + step)
+                strip = RECT(left, rect.top, right, rect.bottom)
+                user32.FillRect(hdc, ctypes.byref(strip), hue_brush(offset + (left - rect.left) / width))
+                left = right
+
+        def draw_rainbow_border(hdc: Any, x: int, y: int, w: int, h: int, width_value: int, now: float) -> None:
+            perimeter = max(1, 2 * (w + h))
+            offset = RAINBOW_DIRECTION * now * RAINBOW_SPEED
+            corners = ((x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y))
+            old_pen = None
+            position = 0.0
+            for edge_index in range(4):
+                x0, y0 = corners[edge_index]
+                x1, y1 = corners[edge_index + 1]
+                edge_length = abs(x1 - x0) + abs(y1 - y0)
+                edge_segments = max(2, int(round(RAINBOW_SEGMENTS * edge_length / perimeter)))
+                for index in range(edge_segments):
+                    t0 = index / edge_segments
+                    t1 = (index + 1) / edge_segments
+                    ax = x0 + int((x1 - x0) * t0)
+                    ay = y0 + int((y1 - y0) * t0)
+                    bx = x0 + int((x1 - x0) * t1)
+                    by = y0 + int((y1 - y0) * t1)
+                    old_pen = gdi32.SelectObject(hdc, hue_pen(position + (edge_length / perimeter) * t0 + offset, width_value))
+                    gdi32.MoveToEx(hdc, ax, ay, None)
+                    gdi32.LineTo(hdc, bx, by)
+                position += edge_length / perimeter
+            if old_pen:
+                gdi32.SelectObject(hdc, old_pen)
+
+        def scale_colorref(color_value: int, factor: float) -> int:
+            def scale(channel: int) -> int:
+                return max(0, min(255, int(round(channel * factor))))
+
+            return (
+                scale((color_value >> 16) & 0xFF) << 16
+                | scale((color_value >> 8) & 0xFF) << 8
+                | scale(color_value & 0xFF)
+            )
+
+        def mix_colorref(color_a: int, color_b: int, ratio: float) -> int:
+            ratio = max(0.0, min(1.0, ratio))
+
+            def channel(value_a: int, value_b: int) -> int:
+                return int(round(value_a + (value_b - value_a) * ratio))
+
+            return (
+                channel((color_a >> 16) & 0xFF, (color_b >> 16) & 0xFF) << 16
+                | channel((color_a >> 8) & 0xFF, (color_b >> 8) & 0xFF) << 8
+                | channel(color_a & 0xFF, color_b & 0xFF)
+            )
+
+        def draw_pulse_border(hdc: Any, x: int, y: int, w: int, h: int, color_value: int, width_value: int, now: float) -> int:
+            factor = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(now * 2 * math.pi / PULSE_PERIOD))
+            factor = round(factor * 8) / 8
+            color = scale_colorref(color_value, factor)
+            old_pen = gdi32.SelectObject(hdc, get_pen(color, width_value))
+            gdi32.Rectangle(hdc, x, y, x + w, y + h)
+            gdi32.SelectObject(hdc, old_pen)
+            return color
+
+        def draw_march_border(hdc: Any, x: int, y: int, w: int, h: int, width_value: int, now: float) -> None:
+            perimeter = max(1, 2 * (w + h))
+            start = -((now * MARCH_SPEED) % (MARCH_SEGMENT * 2))
+            count = int(perimeter // MARCH_SEGMENT) + 3
+            yellow = colorref(MARCH_COLORS[0])
+            dark = colorref(MARCH_COLORS[1])
+            corners = ((x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y))
+            lengths = (w, h, w, h)
+            bounds = (0.0, float(w), float(w + h), float(2 * w + h), float(perimeter))
+            old_pen = None
+            for index in range(count):
+                p0 = start + index * MARCH_SEGMENT
+                p1 = p0 + MARCH_SEGMENT
+                if p1 <= 0 or p0 >= perimeter:
+                    continue
+                lo = max(0.0, p0)
+                hi = min(float(perimeter), p1)
+                old_pen = gdi32.SelectObject(hdc, get_pen(yellow if index % 2 == 0 else dark, width_value))
+                for edge_index in range(4):
+                    edge_start = bounds[edge_index]
+                    edge_end = bounds[edge_index + 1]
+                    seg_start = max(lo, edge_start)
+                    seg_end = min(hi, edge_end)
+                    if seg_start >= seg_end:
+                        continue
+                    x0, y0 = corners[edge_index]
+                    x1, y1 = corners[edge_index + 1]
+                    edge_length = max(1, lengths[edge_index])
+                    t0 = (seg_start - edge_start) / edge_length
+                    t1 = (seg_end - edge_start) / edge_length
+                    gdi32.MoveToEx(hdc, x0 + int((x1 - x0) * t0), y0 + int((y1 - y0) * t0), None)
+                    gdi32.LineTo(hdc, x0 + int((x1 - x0) * t1), y0 + int((y1 - y0) * t1))
+            if old_pen:
+                gdi32.SelectObject(hdc, old_pen)
+
+        def draw_neon_border(hdc: Any, x: int, y: int, w: int, h: int, color_value: int, width_value: int, now: float) -> None:
+            breath = 0.5 + 0.5 * math.sin(now * 2 * math.pi / NEON_PERIOD)
+            main_factor = round((0.70 + 0.30 * breath) * 8) / 8
+            for width_scale, brightness in ((3, 0.30), (2, 0.55), (1, main_factor)):
+                pen = get_pen(scale_colorref(color_value, brightness), max(1, width_value * width_scale))
+                old_pen = gdi32.SelectObject(hdc, pen)
+                gdi32.Rectangle(hdc, x, y, x + w, y + h)
+                gdi32.SelectObject(hdc, old_pen)
+
+        def draw_duotone_border(hdc: Any, x: int, y: int, w: int, h: int, width_value: int, now: float) -> None:
+            perimeter = max(1, 2 * (w + h))
+            steps = max(8, min(64, perimeter // 16))
+            offset = RAINBOW_DIRECTION * now * DUOTONE_SPEED
+            color_a = colorref(DUOTONE_COLORS[0])
+            color_b = colorref(DUOTONE_COLORS[1])
+            corners = ((x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y))
+            old_pen = None
+            position = 0.0
+            for edge_index in range(4):
+                x0, y0 = corners[edge_index]
+                x1, y1 = corners[edge_index + 1]
+                edge_length = abs(x1 - x0) + abs(y1 - y0)
+                edge_steps = max(2, int(round(steps * edge_length / perimeter)))
+                for index in range(edge_steps):
+                    t0 = index / edge_steps
+                    t1 = (index + 1) / edge_steps
+                    ax = x0 + int((x1 - x0) * t0)
+                    ay = y0 + int((y1 - y0) * t0)
+                    bx = x0 + int((x1 - x0) * t1)
+                    by = y0 + int((y1 - y0) * t1)
+                    tpos = ((position + (edge_length / perimeter) * t0 + offset) % 1.0 + 1.0) % 1.0
+                    triangle = tpos * 2 if tpos < 0.5 else (1.0 - tpos) * 2
+                    quantized = round(triangle * 16) / 16
+                    old_pen = gdi32.SelectObject(hdc, get_pen(mix_colorref(color_a, color_b, quantized), width_value))
+                    gdi32.MoveToEx(hdc, ax, ay, None)
+                    gdi32.LineTo(hdc, bx, by)
+                position += edge_length / perimeter
+            if old_pen:
+                gdi32.SelectObject(hdc, old_pen)
+
+        def get_animated_rects() -> List[Any]:
+            message = state["message"]
+            boxes = message.get("boxes") if isinstance(message, dict) else []
+            if not isinstance(boxes, list):
+                return []
+            region = state["region"]
+            win_w = max(1, int(region["width"]))
+            win_h = max(1, int(region["height"]))
+            msg_w = max(1.0, float(message.get("width", win_w)))
+            msg_h = max(1.0, float(message.get("height", win_h)))
+            scale_x = win_w / msg_w
+            scale_y = win_h / msg_h
+            margin = max(1, int(state["overlay"].get("line_width", 3))) * 2 + 2
+            label_bounds = state.get("anim_label_bounds", {})
+            rects = []
+            for index, box in enumerate(boxes):
+                if str(box.get("style") or "") not in ANIMATED_STYLES:
+                    continue
+                left = int(float(box.get("x", 0)) * scale_x) - margin
+                top = int(float(box.get("y", 0)) * scale_y) - (28 + margin)
+                right = int(float(box.get("x", 0)) * scale_x + float(box.get("w", 0)) * scale_x) + margin
+                bottom = int(float(box.get("y", 0)) * scale_y + float(box.get("h", 0)) * scale_y) + margin
+                rect = RECT(max(0, left), max(0, top), min(win_w, right), min(win_h, bottom))
+                bounds = label_bounds.get(index)
+                if bounds is not None:
+                    rect.left = max(0, min(rect.left, bounds[0]))
+                    rect.top = max(0, min(rect.top, bounds[1]))
+                    rect.right = min(win_w, max(rect.right, bounds[2]))
+                    rect.bottom = min(win_h, max(rect.bottom, bounds[3]))
+                rects.append(rect)
+            return rects
+
+        SRCCOPY = 0x00CC0020
+        buffer_dc: Any = None
+        buffer_bitmap: Any = None
+        buffer_default: Any = None
+        buffer_width = 0
+        buffer_height = 0
+
+        def release_buffer() -> None:
+            nonlocal buffer_dc, buffer_bitmap, buffer_default
+            if buffer_dc is not None:
+                if buffer_default is not None:
+                    gdi32.SelectObject(buffer_dc, buffer_default)
+                if buffer_bitmap is not None:
+                    gdi32.DeleteObject(buffer_bitmap)
+                gdi32.DeleteDC(buffer_dc)
+            buffer_dc = None
+            buffer_bitmap = None
+            buffer_default = None
+
+        def ensure_buffer(width_value: int, height_value: int) -> None:
+            nonlocal buffer_dc, buffer_bitmap, buffer_default, buffer_width, buffer_height
+            if buffer_dc is not None and buffer_width == width_value and buffer_height == height_value:
+                return
+            release_buffer()
+            screen_dc = user32.GetDC(None)
+            try:
+                buffer_dc = gdi32.CreateCompatibleDC(screen_dc)
+                buffer_bitmap = gdi32.CreateCompatibleBitmap(screen_dc, width_value, height_value)
+            finally:
+                user32.ReleaseDC(None, screen_dc)
+            buffer_default = gdi32.SelectObject(buffer_dc, buffer_bitmap)
+            buffer_width = width_value
+            buffer_height = height_value
+
         def paint(hwnd: Any) -> int:
             ps = PAINTSTRUCT()
             hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
@@ -1260,77 +1571,146 @@ class DesktopOverlay:
                 region = state["region"]
                 width = max(1, int(region["width"]))
                 height = max(1, int(region["height"]))
+                ensure_buffer(width, height)
+                target = buffer_dc
                 overlay_config = state["desktop_overlay"]
                 bg = colorref(overlay_config.get("transparent_color"), "#010101")
                 bg_brush = gdi32.CreateSolidBrush(bg)
                 try:
-                    full = RECT(0, 0, width, height)
-                    user32.FillRect(hdc, ctypes.byref(full), bg_brush)
+                    user32.FillRect(target, ctypes.byref(ps.rcPaint), bg_brush)
                 finally:
                     gdi32.DeleteObject(bg_brush)
 
                 boxes = get_boxes()
                 debug_border = normalize_bool(overlay_config.get("debug_border", False), False)
-                if not boxes and not debug_border:
-                    return 0
+                anim_label_bounds: Dict[int, Tuple[int, int, int, int]] = {}
+                if boxes or debug_border:
+                    message = state["message"]
+                    msg_width = max(1, float(message.get("width", width)))
+                    msg_height = max(1, float(message.get("height", height)))
+                    scale_x = width / msg_width
+                    scale_y = height / msg_height
+                    overlay = state["overlay"]
+                    default_color = colorref(overlay.get("stroke_color"), DEFAULT_CONFIG["overlay"]["stroke_color"])
+                    line_width = max(1, int(overlay.get("line_width", DEFAULT_CONFIG["overlay"]["line_width"])))
+                    show_label = normalize_bool(overlay.get("show_label", True), True)
 
-                message = state["message"]
-                msg_width = max(1, float(message.get("width", width)))
-                msg_height = max(1, float(message.get("height", height)))
-                scale_x = width / msg_width
-                scale_y = height / msg_height
-                overlay = state["overlay"]
-                default_color = colorref(overlay.get("stroke_color"), DEFAULT_CONFIG["overlay"]["stroke_color"])
-                line_width = max(1, int(overlay.get("line_width", DEFAULT_CONFIG["overlay"]["line_width"])))
-                show_label = normalize_bool(overlay.get("show_label", True), True)
-
-                pen = gdi32.CreatePen(PS_SOLID, line_width, default_color)
-                old_pen = gdi32.SelectObject(hdc, pen)
-                old_brush = gdi32.SelectObject(hdc, gdi32.GetStockObject(NULL_BRUSH))
-                try:
-                    if debug_border:
-                        gdi32.Rectangle(hdc, 1, 1, width - 1, height - 1)
-                    gdi32.SelectObject(hdc, old_pen)
-                    gdi32.DeleteObject(pen)
-                    pen = None
-                    for box in boxes:
-                        x = int(float(box.get("x", 0)) * scale_x)
-                        y = int(float(box.get("y", 0)) * scale_y)
-                        w = int(float(box.get("w", 0)) * scale_x)
-                        h = int(float(box.get("h", 0)) * scale_y)
-                        if w <= 0 or h <= 0:
-                            continue
-                        color = colorref(box.get("color"), overlay.get("stroke_color", DEFAULT_CONFIG["overlay"]["stroke_color"]))
-                        box_pen = gdi32.CreatePen(PS_SOLID, line_width, color)
-                        old_box_pen = gdi32.SelectObject(hdc, box_pen)
-                        gdi32.Rectangle(hdc, x, y, x + w, y + h)
-                        gdi32.SelectObject(hdc, old_box_pen)
-                        gdi32.DeleteObject(box_pen)
-                        if show_label:
-                            label = str(
-                                box.get("label") or box.get("matched") or box.get("text") or ""
-                            )
-                            if label:
-                                label_rect = RECT(x, max(0, y - 22), x + max(120, len(label) * 18), max(22, y))
-                                label_brush = gdi32.CreateSolidBrush(color)
-                                try:
-                                    user32.FillRect(hdc, ctypes.byref(label_rect), label_brush)
-                                finally:
-                                    gdi32.DeleteObject(label_brush)
-                                gdi32.SetBkMode(hdc, TRANSPARENT)
-                                gdi32.SetTextColor(hdc, colorref("#ffffff", "#ffffff"))
-                                user32.DrawTextW(
-                                    hdc,
-                                    label,
-                                    len(label),
-                                    ctypes.byref(label_rect),
-                                    DT_LEFT | DT_TOP | DT_SINGLELINE,
+                    old_brush = gdi32.SelectObject(target, gdi32.GetStockObject(NULL_BRUSH))
+                    now = time.monotonic()
+                    try:
+                        if debug_border:
+                            old_pen = gdi32.SelectObject(target, get_pen(default_color, line_width))
+                            gdi32.Rectangle(target, 1, 1, width - 1, height - 1)
+                            gdi32.SelectObject(target, old_pen)
+                        for index, box in enumerate(boxes):
+                            x = int(float(box.get("x", 0)) * scale_x)
+                            y = int(float(box.get("y", 0)) * scale_y)
+                            w = int(float(box.get("w", 0)) * scale_x)
+                            h = int(float(box.get("h", 0)) * scale_y)
+                            if w <= 0 or h <= 0:
+                                continue
+                            box_style = str(box.get("style") or "")
+                            color = colorref(box.get("color"), overlay.get("stroke_color", DEFAULT_CONFIG["overlay"]["stroke_color"]))
+                            label_bg = color
+                            label_fg = colorref("#ffffff", "#ffffff")
+                            if box_style == "rainbow":
+                                draw_rainbow_border(target, x, y, w, h, line_width, now)
+                            elif box_style == "flash":
+                                flash_on = int(now * FLASH_HZ * 2) % 2 == 0
+                                label_bg = colorref("#ff3b30", "#ff3b30") if flash_on else colorref("#ffffff", "#ffffff")
+                                label_fg = colorref("#ffffff", "#ffffff") if flash_on else colorref("#000000", "#000000")
+                                box_pen = get_pen(label_bg, line_width)
+                                old_box_pen = gdi32.SelectObject(target, box_pen)
+                                gdi32.Rectangle(target, x, y, x + w, y + h)
+                                gdi32.SelectObject(target, old_box_pen)
+                            elif box_style == "pulse":
+                                label_bg = draw_pulse_border(target, x, y, w, h, color, line_width, now)
+                            elif box_style == "march":
+                                draw_march_border(target, x, y, w, h, line_width, now)
+                                label_bg = colorref(MARCH_COLORS[0])
+                                label_fg = colorref(MARCH_COLORS[1])
+                            elif box_style == "neon":
+                                draw_neon_border(target, x, y, w, h, color, line_width, now)
+                            elif box_style == "duotone":
+                                draw_duotone_border(target, x, y, w, h, line_width, now)
+                                label_bg = colorref(DUOTONE_COLORS[0])
+                            else:
+                                box_pen = get_pen(color, line_width)
+                                old_box_pen = gdi32.SelectObject(target, box_pen)
+                                gdi32.Rectangle(target, x, y, x + w, y + h)
+                                gdi32.SelectObject(target, old_box_pen)
+                            if show_label:
+                                label = str(
+                                    box.get("label") or box.get("matched") or box.get("text") or ""
                                 )
-                finally:
-                    gdi32.SelectObject(hdc, old_brush)
-                    gdi32.SelectObject(hdc, old_pen)
-                    if pen:
-                        gdi32.DeleteObject(pen)
+                                if label:
+                                    measure_rect = RECT(0, 0, 0, 0)
+                                    user32.DrawTextW(
+                                        target,
+                                        label,
+                                        len(label),
+                                        ctypes.byref(measure_rect),
+                                        DT_LEFT | DT_TOP | DT_SINGLELINE | DT_CALCRECT,
+                                    )
+                                    label_w = max(1, measure_rect.right - measure_rect.left) + 10
+                                    label_h = max(1, measure_rect.bottom - measure_rect.top) + 4
+                                    label_top = max(0, y - label_h)
+                                    label_rect = RECT(x, label_top, x + label_w, label_top + label_h)
+                                    if box_style == "rainbow":
+                                        draw_rainbow_label(target, label_rect, now)
+                                    else:
+                                        label_brush = gdi32.CreateSolidBrush(label_bg)
+                                        try:
+                                            user32.FillRect(target, ctypes.byref(label_rect), label_brush)
+                                        finally:
+                                            gdi32.DeleteObject(label_brush)
+                                    gdi32.SetBkMode(target, TRANSPARENT)
+                                    if box_style == "rainbow":
+                                        gdi32.SetTextColor(target, colorref("#000000", "#000000"))
+                                        for offset_x, offset_y in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)):
+                                            outline_rect = RECT(
+                                                label_rect.left + offset_x,
+                                                label_rect.top + offset_y,
+                                                label_rect.right + offset_x,
+                                                label_rect.bottom + offset_y,
+                                            )
+                                            user32.DrawTextW(
+                                                target,
+                                                label,
+                                                len(label),
+                                                ctypes.byref(outline_rect),
+                                                DT_LEFT | DT_TOP | DT_SINGLELINE,
+                                            )
+                                    gdi32.SetTextColor(target, label_fg)
+                                    user32.DrawTextW(
+                                        target,
+                                        label,
+                                        len(label),
+                                        ctypes.byref(label_rect),
+                                        DT_LEFT | DT_TOP | DT_SINGLELINE,
+                                    )
+                                    if box_style in ANIMATED_STYLES:
+                                        anim_label_bounds[index] = (
+                                            label_rect.left,
+                                            label_rect.top,
+                                            label_rect.right,
+                                            label_rect.bottom,
+                                        )
+                    finally:
+                        gdi32.SelectObject(target, old_brush)
+                state["anim_label_bounds"] = anim_label_bounds
+
+                gdi32.BitBlt(
+                    hdc,
+                    ps.rcPaint.left,
+                    ps.rcPaint.top,
+                    max(0, ps.rcPaint.right - ps.rcPaint.left),
+                    max(0, ps.rcPaint.bottom - ps.rcPaint.top),
+                    target,
+                    ps.rcPaint.left,
+                    ps.rcPaint.top,
+                    SRCCOPY,
+                )
             finally:
                 user32.EndPaint(hwnd, ctypes.byref(ps))
             return 0
@@ -1449,11 +1829,19 @@ class DesktopOverlay:
                 apply_window()
             return True
 
+        last_anim_at = 0.0
         msg = MSG()
         try:
             while not self._stop_event.is_set():
                 if not drain_queue():
                     break
+                now = time.monotonic()
+                if state["visible"] and now - last_anim_at >= ANIM_INTERVAL:
+                    rects = get_animated_rects()
+                    if rects:
+                        for rect in rects:
+                            user32.InvalidateRect(hwnd, ctypes.byref(rect), False)
+                        last_anim_at = now
                 while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
                     user32.TranslateMessage(ctypes.byref(msg))
                     user32.DispatchMessageW(ctypes.byref(msg))
@@ -1467,6 +1855,15 @@ class DesktopOverlay:
                 user32.UnregisterClassW(class_name, hinstance)
             except Exception:
                 pass
+            if buffer_dc is not None:
+                gdi32.SelectObject(buffer_dc, gdi32.GetStockObject(NULL_PEN))
+            for cached_pen in pen_cache.values():
+                gdi32.DeleteObject(cached_pen)
+            pen_cache.clear()
+            for cached_brush in brush_cache.values():
+                gdi32.DeleteObject(cached_brush)
+            brush_cache.clear()
+            release_buffer()
 
 
 @dataclass(eq=False)
@@ -1902,7 +2299,7 @@ def find_match_detail(
     for target in targets:
         needle = target if case_sensitive else target.casefold()
         if match_text(source, needle, mode):
-            return MatchResult(target=target, method="原始匹配", score=1.0)
+            return MatchResult(target=target, method="原始匹配", score=1.0, kind="raw")
 
     tolerance = deep_merge(DEFAULT_CONFIG["match_tolerance"], tolerance_config or {})
     if not normalize_bool(tolerance.get("enabled", True), True):
@@ -1912,7 +2309,7 @@ def find_match_detail(
     for target in targets:
         tolerant_needle = prepare_tolerant_text(target, case_sensitive, tolerance)
         if match_text(tolerant_source, tolerant_needle, mode):
-            return MatchResult(target=target, method="归一化/重复字符容错", score=1.0)
+            return MatchResult(target=target, method="归一化/重复字符容错", score=1.0, kind="normalized")
 
     try:
         max_edit_distance = int(tolerance.get("max_edit_distance", 1))
@@ -1936,7 +2333,7 @@ def find_match_detail(
             if distance <= max_edit_distance:
                 score = 1.0 - (distance / max(len(tolerant_source), len(tolerant_needle), 1))
                 if best_result is None or score > best_result.score:
-                    best_result = MatchResult(target=target, method="编辑距离容错", score=score)
+                    best_result = MatchResult(target=target, method="编辑距离容错", score=score, kind="edit")
         if best_result is not None:
             return best_result
 
@@ -1957,9 +2354,55 @@ def find_match_detail(
 
         score = similarity_score(tolerant_source, tolerant_needle)
         if score >= threshold and (best_result is None or score > best_result.score):
-            best_result = MatchResult(target=target, method="相似度容错", score=score)
+            best_result = MatchResult(target=target, method="相似度容错", score=score, kind="fuzzy")
 
     return best_result
+
+
+def match_confidence_factor(
+    match: MatchResult,
+    text: str,
+    match_config: Dict[str, Any],
+    tolerance_config: Optional[Dict[str, Any]] = None,
+) -> float:
+    if match.kind == "raw":
+        case_sensitive = normalize_bool(match_config.get("case_sensitive", False), False)
+        source = text if case_sensitive else text.casefold()
+        needle = match.target if case_sensitive else match.target.casefold()
+        if source == needle:
+            return 1.0
+        source_length = len(strip_match_separators(source))
+        needle_length = len(strip_match_separators(needle))
+        coverage = needle_length / max(1, source_length)
+        return 0.5 + 0.5 * min(1.0, coverage)
+
+    if match.kind == "normalized":
+        return 0.90
+
+    if match.kind == "edit":
+        return 0.85 * min(1.0, max(0.0, float(match.score)))
+
+    if match.kind == "fuzzy":
+        tolerance = deep_merge(DEFAULT_CONFIG["match_tolerance"], tolerance_config or {})
+        try:
+            threshold = float(tolerance.get("fuzzy_threshold", 0.88))
+        except (TypeError, ValueError):
+            threshold = 0.88
+        threshold = min(1.0, max(0.0, threshold))
+        span = max(1e-6, 1.0 - threshold)
+        ratio = (float(match.score) - threshold) / span
+        return 0.60 + 0.40 * min(1.0, max(0.0, ratio))
+
+    return 0.5
+
+
+def fuse_confidence(ocr_conf: float, factor: float) -> float:
+    ocr = min(1.0, max(0.0, float(ocr_conf)))
+    match_factor = min(1.0, max(0.0, float(factor)))
+    if ocr <= 0.0 or match_factor <= 0.0:
+        return 0.0
+    fused = (ocr ** OCR_CONF_WEIGHT) * (match_factor ** MATCH_CONF_WEIGHT)
+    return min(MAX_FUSED_CONFIDENCE, fused)
 
 
 def find_match(
@@ -2331,7 +2774,7 @@ async def recognition_loop(server: OverlayServer, stop_event: asyncio.Event) -> 
     desktop_overlay = DesktopOverlay()
     obs_client = OBSWebSocketScreenshotClient()
     config = load_config(write_if_missing=True)
-    targets, target_groups = read_targets_and_groups()
+    targets, target_groups, target_styles = read_targets_and_groups()
     target_color_map = build_target_color_map(targets, config)
     last_reload_at = 0.0
     last_perf_log_at = 0.0
@@ -2343,7 +2786,7 @@ async def recognition_loop(server: OverlayServer, stop_event: asyncio.Event) -> 
                 reload_interval = int(config.get("ocr", {}).get("reload_files_interval_ms", 2000)) / 1000.0
                 if now - last_reload_at >= max(0.2, reload_interval):
                     config = load_config(write_if_missing=True)
-                    targets, target_groups = read_targets_and_groups()
+                    targets, target_groups, target_styles = read_targets_and_groups()
                     target_color_map = build_target_color_map(targets, config)
                     last_reload_at = now
                 interval = get_interval_seconds(config)
@@ -2374,17 +2817,25 @@ async def recognition_loop(server: OverlayServer, stop_event: asyncio.Event) -> 
                         for item in items:
                             if item.confidence < min_confidence:
                                 continue
-                            matched = find_match(item.text, targets, match_config, tolerance_config)
-                            if matched is None:
+                            detail = find_match_detail(item.text, targets, match_config, tolerance_config)
+                            if detail is None:
                                 continue
+
+                            matched = detail.target
+                            final_confidence = fuse_confidence(
+                                item.confidence,
+                                match_confidence_factor(detail, item.text, match_config, tolerance_config),
+                            )
 
                             rect = item.rect
                             boxes.append(
                                 {
                                     "text": item.text,
                                     "matched": matched,
-                                    "label": build_target_label(matched, target_groups),
+                                    "style": target_styles.get(str(matched).casefold()) or None,
+                                    "label": build_target_label(matched, target_groups, final_confidence),
                                     "confidence": round(float(item.confidence), 4),
+                                    "final_confidence": round(float(final_confidence), 4),
                                     "color": get_box_color(matched, config, target_color_map),
                                     "x": round(float(rect["x"]), 2),
                                     "y": round(float(rect["y"]), 2),

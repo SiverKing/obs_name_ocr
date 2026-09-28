@@ -33,12 +33,26 @@
       line_width: 3,
       show_label: true
     };
+    const ANIM_FPS = 30;
+    const RAINBOW_SPEED = 0.2;
+    const RAINBOW_DIRECTION = 1;
+    const FLASH_HZ = 2.0;
+    const PULSE_PERIOD = 1.2;
+    const NEON_PERIOD = 1.6;
+    const MARCH_SPEED = 40;
+    const MARCH_DASH = 8;
+    const DUOTONE_SPEED = 0.1;
+    const DUOTONE_COLORS = ["#00c7be", "#af52de"];
+    const MARCH_COLORS = ["#ffcc00", "#1a1a1a"];
+    const ANIMATED_STYLES = new Set(["rainbow", "flash", "pulse", "march", "neon", "duotone"]);
+    const ANIM_INTERVAL = 1000 / ANIM_FPS;
 
     const canvas = document.getElementById("overlay");
     const ctx = canvas.getContext("2d");
     let latestMessage = null;
     let socket = null;
     let reconnectTimer = null;
+    let lastAnimAt = 0;
 
     function resizeCanvas() {
       const dpr = window.devicePixelRatio || 1;
@@ -53,6 +67,172 @@
 
     function clear() {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    function rectPoint(position, x, y, w, h) {
+      const p = ((position % 1) + 1) % 1;
+      if (p < 0.25) {
+        return [x + w * (p / 0.25), y];
+      }
+      if (p < 0.5) {
+        return [x + w, y + h * ((p - 0.25) / 0.25)];
+      }
+      if (p < 0.75) {
+        return [x + w - w * ((p - 0.5) / 0.25), y + h];
+      }
+      return [x, y + h - h * ((p - 0.75) / 0.25)];
+    }
+
+    function drawRainbowStroke(x, y, w, h) {
+      const t = performance.now() / 1000;
+      const start = RAINBOW_DIRECTION * t * RAINBOW_SPEED * Math.PI * 2;
+      if (typeof ctx.createConicGradient === "function") {
+        const gradient = ctx.createConicGradient(start, x + w / 2, y + h / 2);
+        for (let i = 0; i <= 6; i += 1) {
+          gradient.addColorStop(i / 6, `hsl(${60 * i}, 100%, 55%)`);
+        }
+        ctx.strokeStyle = gradient;
+        ctx.strokeRect(x, y, w, h);
+        return;
+      }
+      const segments = Math.max(8, Math.min(48, Math.round((2 * (w + h)) / 24)));
+      const offset = RAINBOW_DIRECTION * t * RAINBOW_SPEED;
+      for (let index = 0; index < segments; index += 1) {
+        const p0 = index / segments;
+        const p1 = (index + 1) / segments;
+        const hue = ((((p0 + offset) % 1) + 1) % 1) * 360;
+        const [x0, y0] = rectPoint(p0, x, y, w, h);
+        const [x1, y1] = rectPoint(p1, x, y, w, h);
+        ctx.strokeStyle = `hsl(${hue}, 100%, 55%)`;
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        ctx.stroke();
+      }
+    }
+
+    function hexToRgb(hex) {
+      const text = String(hex).trim().replace("#", "");
+      if (text.length !== 6) {
+        return null;
+      }
+      const value = parseInt(text, 16);
+      if (Number.isNaN(value)) {
+        return null;
+      }
+      return [(value >> 16) & 255, (value >> 8) & 255, value & 255];
+    }
+
+    function scaleColor(hex, factor) {
+      const rgb = hexToRgb(hex);
+      if (!rgb) {
+        return hex;
+      }
+      const clamp = (v) => Math.max(0, Math.min(255, Math.round(v)));
+      return `rgb(${clamp(rgb[0] * factor)}, ${clamp(rgb[1] * factor)}, ${clamp(rgb[2] * factor)})`;
+    }
+
+    function mixColor(a, b, ratio) {
+      const ra = hexToRgb(a);
+      const rb = hexToRgb(b);
+      if (!ra || !rb) {
+        return a;
+      }
+      const k = Math.max(0, Math.min(1, ratio));
+      const clamp = (v) => Math.max(0, Math.min(255, Math.round(v)));
+      return `rgb(${clamp(ra[0] + (rb[0] - ra[0]) * k)}, ${clamp(ra[1] + (rb[1] - ra[1]) * k)}, ${clamp(ra[2] + (rb[2] - ra[2]) * k)})`;
+    }
+
+    function drawPulseStroke(x, y, w, h, color, t) {
+      const factor = 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(t * 2 * Math.PI / PULSE_PERIOD));
+      const pulseColor = scaleColor(color, factor);
+      ctx.strokeStyle = pulseColor;
+      ctx.strokeRect(x, y, w, h);
+      return pulseColor;
+    }
+
+    function drawMarchStroke(x, y, w, h, t, dpr) {
+      const dash = MARCH_DASH * dpr;
+      const offset = (t * MARCH_SPEED * dpr) % (dash * 2);
+      ctx.save();
+      ctx.setLineDash([dash, dash]);
+      ctx.lineDashOffset = -offset;
+      ctx.strokeStyle = MARCH_COLORS[0];
+      ctx.strokeRect(x, y, w, h);
+      ctx.lineDashOffset = -offset + dash;
+      ctx.strokeStyle = MARCH_COLORS[1];
+      ctx.strokeRect(x, y, w, h);
+      ctx.restore();
+    }
+
+    function drawNeonStroke(x, y, w, h, color, t, dpr) {
+      const breath = 0.5 + 0.5 * Math.sin(t * 2 * Math.PI / NEON_PERIOD);
+      ctx.save();
+      ctx.shadowColor = color;
+      ctx.shadowBlur = (10 + 8 * breath) * dpr;
+      ctx.strokeStyle = color;
+      ctx.strokeRect(x, y, w, h);
+      ctx.restore();
+    }
+
+    function drawDuotoneStroke(x, y, w, h, t) {
+      const cx = x + w / 2;
+      const cy = y + h / 2;
+      const start = RAINBOW_DIRECTION * t * DUOTONE_SPEED * Math.PI * 2;
+      if (typeof ctx.createConicGradient === "function") {
+        const gradient = ctx.createConicGradient(start, cx, cy);
+        gradient.addColorStop(0, DUOTONE_COLORS[0]);
+        gradient.addColorStop(0.5, DUOTONE_COLORS[1]);
+        gradient.addColorStop(1, DUOTONE_COLORS[0]);
+        ctx.strokeStyle = gradient;
+        ctx.strokeRect(x, y, w, h);
+        return;
+      }
+      const perimeter = Math.max(1, 2 * (w + h));
+      const steps = Math.max(8, Math.min(64, Math.round(perimeter / 16)));
+      const offset = RAINBOW_DIRECTION * t * DUOTONE_SPEED;
+      const corners = [
+        [x, y],
+        [x + w, y],
+        [x + w, y + h],
+        [x, y + h],
+        [x, y]
+      ];
+      let startPosition = 0;
+      for (let edge = 0; edge < 4; edge += 1) {
+        const [ax, ay] = corners[edge];
+        const [bx, by] = corners[edge + 1];
+        const length = Math.abs(bx - ax) + Math.abs(by - ay);
+        const count = Math.max(2, Math.round(steps * length / perimeter));
+        for (let index = 0; index < count; index += 1) {
+          const t0 = index / count;
+          const t1 = (index + 1) / count;
+          const position = startPosition + (length / perimeter) * t0;
+          const tpos = ((position + offset) % 1 + 1) % 1;
+          const triangle = tpos < 0.5 ? tpos * 2 : (1 - tpos) * 2;
+          ctx.strokeStyle = mixColor(DUOTONE_COLORS[0], DUOTONE_COLORS[1], triangle);
+          ctx.beginPath();
+          ctx.moveTo(ax + (bx - ax) * t0, ay + (by - ay) * t0);
+          ctx.lineTo(ax + (bx - ax) * t1, ay + (by - ay) * t1);
+          ctx.stroke();
+        }
+        startPosition += length / perimeter;
+      }
+    }
+
+    function hasAnimatedBoxes(message) {
+      if (!message || message.type !== "boxes" || !Array.isArray(message.boxes)) {
+        return false;
+      }
+      return message.boxes.some((box) => ANIMATED_STYLES.has(String(box.style || "")));
+    }
+
+    function animationLoop(timestamp) {
+      if (hasAnimatedBoxes(latestMessage) && timestamp - lastAnimAt >= ANIM_INTERVAL) {
+        lastAnimAt = timestamp;
+        draw(latestMessage);
+      }
+      window.requestAnimationFrame(animationLoop);
     }
 
     function draw(message) {
@@ -70,6 +250,7 @@
       const overlay = Object.assign({}, DEFAULT_OVERLAY, message.overlay || {});
       const scaleX = canvas.width / message.width;
       const scaleY = canvas.height / message.height;
+      const t = performance.now() / 1000;
 
       ctx.save();
       ctx.lineWidth = Math.max(1, Number(overlay.line_width || DEFAULT_OVERLAY.line_width)) * dpr;
@@ -86,9 +267,36 @@
           continue;
         }
 
+        const style = String(box.style || "");
         const color = String(box.color || overlay.stroke_color || DEFAULT_OVERLAY.stroke_color);
-        ctx.strokeStyle = color;
-        ctx.strokeRect(x, y, w, h);
+        let labelBackground = color;
+        let labelColor = "#ffffff";
+
+        if (style === "rainbow") {
+          drawRainbowStroke(x, y, w, h);
+          labelBackground = "#1a1a1a";
+          labelColor = "#ffffff";
+        } else if (style === "flash") {
+          const on = Math.floor(t * FLASH_HZ * 2) % 2 === 0;
+          ctx.strokeStyle = on ? "#ff3b30" : "#ffffff";
+          ctx.strokeRect(x, y, w, h);
+          labelBackground = on ? "#ff3b30" : "#ffffff";
+          labelColor = on ? "#ffffff" : "#000000";
+        } else if (style === "pulse") {
+          labelBackground = drawPulseStroke(x, y, w, h, color, t);
+        } else if (style === "march") {
+          drawMarchStroke(x, y, w, h, t, dpr);
+          labelBackground = MARCH_COLORS[0];
+          labelColor = MARCH_COLORS[1];
+        } else if (style === "neon") {
+          drawNeonStroke(x, y, w, h, color, t, dpr);
+        } else if (style === "duotone") {
+          drawDuotoneStroke(x, y, w, h, t);
+          labelBackground = DUOTONE_COLORS[0];
+        } else {
+          ctx.strokeStyle = color;
+          ctx.strokeRect(x, y, w, h);
+        }
 
         if (overlay.show_label) {
           const label = String(box.label || box.matched || box.text || "");
@@ -100,9 +308,9 @@
             const labelH = Math.ceil(20 * dpr);
             const labelY = Math.max(0, y - labelH - 2 * dpr);
 
-            ctx.fillStyle = color;
+            ctx.fillStyle = labelBackground;
             ctx.fillRect(x, labelY, labelW, labelH);
-            ctx.fillStyle = "#ffffff";
+            ctx.fillStyle = labelColor;
             ctx.fillText(label, x + paddingX, labelY + paddingY);
           }
         }
@@ -140,6 +348,7 @@
     }
 
     window.addEventListener("resize", resizeCanvas);
+    window.requestAnimationFrame(animationLoop);
     resizeCanvas();
     connect();
   </script>

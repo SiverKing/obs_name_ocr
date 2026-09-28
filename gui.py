@@ -1,6 +1,6 @@
 # 版权所有 © 2026 www.siver.top
 # 修改这里即可更新 GUI 显示的版本号
-APP_VERSION = "v13"
+APP_VERSION = "v14"
 
 import asyncio
 import base64
@@ -59,6 +59,15 @@ CONFIG_PATH = BASE_DIR / "config.json"
 NAME_PATH = BASE_DIR / "name.txt"
 WORKER_PATH = BASE_DIR / "worker.py"
 LOG_DIR = BASE_DIR / "logs"
+
+GROUP_STYLE_HELP = (
+    ("#R", "rainbow 彩虹流光", "彩虹沿边框流动，约 2 秒一圈；标签为彩虹底色白字描边。"),
+    ("#F", "flash 红白闪烁", "边框与标签在红、白之间交替闪烁，每秒 2 次。"),
+    ("#P", "pulse 呼吸脉冲", "边框亮度按 1.2 秒周期在 55% ~ 100% 之间呼吸。"),
+    ("#M", "march 黄黑警戒", "黄黑相间的警戒段沿边框滚动，像跑马灯。"),
+    ("#N", "neon 霓虹光晕", "保留自动分色，边框外圈同色柔光按 1.6 秒周期呼吸。"),
+    ("#D", "duotone 双色渐变", "青色 #00c7be 与紫色 #af52de 沿边框循环流动。"),
+)
 
 
 def daily_log_path() -> Path:
@@ -457,6 +466,43 @@ class SourcePickerDialog(QDialog):
         super().accept()
 
 
+class StyleHelpDialog(QDialog):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("分组特效说明")
+        self.resize(780, 420)
+        self.setMinimumSize(660, 340)
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "在目标文字 name.txt 中给分组表头加后缀即可启用特效，例如 “# 黑名单#R”，"
+            "该分组下的目标全部使用对应特效，标签仍显示“分组：目标 - 百分比”。\n"
+            "后缀大小写不敏感；不带后缀的分组保持默认自动分色；同一目标重复出现时，"
+            "以第一次出现的分组和特效为准。OBS 浏览器源与桌面透明层均已支持。"
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        table = QTableWidget(len(GROUP_STYLE_HELP), 3, self)
+        table.setHorizontalHeaderLabels(["后缀", "特效", "效果"])
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        for row, values in enumerate(GROUP_STYLE_HELP):
+            for column, value in enumerate(values):
+                table.setItem(row, column, QTableWidgetItem(value))
+        table.resizeRowsToContents()
+        layout.addWidget(table, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -569,6 +615,12 @@ class MainWindow(QMainWindow):
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
+        self.style_help_button = QPushButton("特效说明")
+        self.style_help_button.setObjectName("neutralButton")
+        self.style_help_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation))
+        self.style_help_button.clicked.connect(self.show_style_help)
+        buttons.addWidget(self.style_help_button)
+
         self.save_name_button = QPushButton("保存")
         self.save_name_button.setObjectName("primaryButton")
         self.save_name_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
@@ -1071,6 +1123,9 @@ class MainWindow(QMainWindow):
             }
             """
         )
+
+    def show_style_help(self) -> None:
+        StyleHelpDialog(self).exec()
 
     def load_name_file(self) -> None:
         try:
