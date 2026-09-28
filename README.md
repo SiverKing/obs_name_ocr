@@ -6,11 +6,11 @@
 
 [![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078d6?logo=windows&logoColor=white)](#)
-[![GUI](https://img.shields.io/badge/GUI-v14-6b7280)](#)
+[![GUI](https://img.shields.io/badge/GUI-v15-6b7280)](#)
 
 </div>
 
-当前 GUI 版本：`v14`。版本号集中定义在 `gui.py` 顶部的 `APP_VERSION`，修改该常量即可更新窗口标题和工具栏显示。
+当前 GUI 版本：`v15`。版本号集中定义在 `gui.py` 顶部的 `APP_VERSION`，修改该常量即可更新窗口标题和工具栏显示。
 
 worker 会读取当前目录的 `name.txt`，按 `config.json` 配置截图并 OCR。命中目标文字后，会通过 WebSocket 推送给 `overlay.html`，也可以按配置开启 Windows 桌面透明覆盖层。
 
@@ -585,6 +585,8 @@ Windows 缩放会让文字和窗口变大，但截图区域仍按实际像素处
 
 桌面透明层同样支持分组特效（`#R/#F/#P/#M/#N/#D`）：动画刷新上限 30fps，只重绘动效框及其标签区域；没有动效框时开销与旧版一致。
 
+桌面透明层在 worker 的独立子进程中渲染，动画不会和 OCR / 匹配争抢 GIL；子进程与主进程使用相同的 DPI 感知，缩放显示器下框位置和文字清晰度正常；worker 正常退出或被强制结束时子进程会自动退出，不会残留置顶窗口。
+
 如果你想让红框直接显示在自己的屏幕上，打开：
 
 ```json
@@ -708,6 +710,11 @@ OBS 浏览器源：
 7. 点击“保存配置”。
 
 `source_uuid` 优先级高于 `source_name`。如果 OBS 里重命名了来源但 UUID 没变，保留 UUID 通常更稳定。
+
+使用 OBS 截图时，worker 的日志会区分两类错误并给出提示（同类错误只记一次，恢复后记录一条恢复日志）：
+
+- 连不上 OBS：`【OBS 未连接】请确认 OBS 已打开，且“工具 > WebSocket 服务器设置”已开启；并检查地址、端口和密码。`
+- 连上但取不到画面：`【OBS 画面获取失败】请检查是否已在 OBS 中添加并正确设置捕获画面（游戏捕获 / 窗口捕获 / 显示器捕获），以及 source_name / source_uuid 是否指向该捕获源。`
 
 OBS WebSocket 截图适合 500ms 到数秒级的 OCR 轮询，不是高帧率实时帧流。频率太高时，优先降低 `interval_ms` 的压力、降低 `image_width/image_height`，或改用 `jpg` 并适当调低 `image_compression_quality`。
 

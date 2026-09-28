@@ -12,7 +12,7 @@
     "obs_websocket": {
       "url": "ws://127.0.0.1:4455",
       "password": "",
-      "source_name": "窗口采集",
+      "source_name": "PUBG",
       "source_uuid": "000d8353-99f2-4d67-9ea8-a40f58fa364d",
       "image_format": "jpg",
       "image_width": 0,

@@ -9,6 +9,7 @@ import io
 import json
 import logging
 import math
+import multiprocessing
 import os
 import queue
 import signal
@@ -886,6 +887,14 @@ class RapidOCREngine:
         return None
 
 
+class OBSConnectionError(RuntimeError):
+    pass
+
+
+class OBSCaptureError(RuntimeError):
+    pass
+
+
 class OBSWebSocketScreenshotClient:
     def __init__(self) -> None:
         self._ws: Any = None
@@ -912,36 +921,47 @@ class OBSWebSocketScreenshotClient:
         password = str(obs_config.get("password") or "")
         source_name = str(obs_config.get("source_name") or "")
         source_uuid = str(obs_config.get("source_uuid") or "")
-        if not source_name and not source_uuid:
-            source_name = await self._get_current_program_scene_name(url, password)
-        source_info = await self._get_source_info(url, password, source_name, source_uuid)
 
-        image_format = str(obs_config.get("image_format") or "png")
-        width_hint = int(obs_config.get("image_width") or capture.get("width") or 0)
-        height_hint = int(obs_config.get("image_height") or capture.get("height") or 0)
-        quality = int(obs_config.get("image_compression_quality") or 80)
+        try:
+            if not source_name and not source_uuid:
+                source_name = await self._get_current_program_scene_name(url, password)
+            source_info = await self._get_source_info(url, password, source_name, source_uuid)
 
-        request_data: Dict[str, Any] = {
-            "imageFormat": image_format,
-            "imageCompressionQuality": quality,
-        }
-        if source_uuid:
-            request_data["sourceUuid"] = source_uuid
-        else:
-            request_data["sourceName"] = source_name
-        if width_hint > 0:
-            request_data["imageWidth"] = width_hint
-        if height_hint > 0:
-            request_data["imageHeight"] = height_hint
+            image_format = str(obs_config.get("image_format") or "png")
+            width_hint = int(obs_config.get("image_width") or capture.get("width") or 0)
+            height_hint = int(obs_config.get("image_height") or capture.get("height") or 0)
+            quality = int(obs_config.get("image_compression_quality") or 80)
 
-        response = await self._request(url, password, "GetSourceScreenshot", request_data)
-        status = response.get("requestStatus", {})
-        if not status.get("result"):
-            raise RuntimeError(f"OBS GetSourceScreenshot 失败: {status}")
+            request_data: Dict[str, Any] = {
+                "imageFormat": image_format,
+                "imageCompressionQuality": quality,
+            }
+            if source_uuid:
+                request_data["sourceUuid"] = source_uuid
+            else:
+                request_data["sourceName"] = source_name
+            if width_hint > 0:
+                request_data["imageWidth"] = width_hint
+            if height_hint > 0:
+                request_data["imageHeight"] = height_hint
 
-        image_data = response.get("responseData", {}).get("imageData", "")
-        image = self._decode_image_data(image_data)
-        height, width = image.shape[:2]
+            response = await self._request(url, password, "GetSourceScreenshot", request_data)
+            status = response.get("requestStatus", {})
+            if not status.get("result"):
+                raise RuntimeError(f"OBS GetSourceScreenshot 失败: {status}")
+
+            image_data = response.get("responseData", {}).get("imageData", "")
+            image = self._decode_image_data(image_data)
+            height, width = image.shape[:2]
+        except (OBSConnectionError, OBSCaptureError):
+            raise
+        except Exception as exc:
+            raise OBSCaptureError(
+                "【OBS 画面获取失败】已连接 OBS，但没有拿到捕获画面：请检查 OBS 中是否已添加并正确设置捕获画面"
+                "（游戏捕获 / 窗口捕获 / 显示器捕获），以及 capture.obs_websocket.source_name / source_uuid 是否指向该捕获源。"
+                f"原始错误：{exc}"
+            ) from exc
+
         region = {
             "left": int(capture.get("left", 0) or 0),
             "top": int(capture.get("top", 0) or 0),
@@ -987,31 +1007,40 @@ class OBSWebSocketScreenshotClient:
         await self.close()
         import websockets
 
-        self._ws = await websockets.connect(
-            url,
-            subprotocols=["obswebsocket.json"],
-            max_size=None,
-        )
-        self._url = url
-        self._password = password
+        try:
+            self._ws = await websockets.connect(
+                url,
+                subprotocols=["obswebsocket.json"],
+                max_size=None,
+            )
+            self._url = url
+            self._password = password
 
-        hello = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=5))
-        data = hello.get("d", {})
-        self._rpc_version = min(int(data.get("rpcVersion", 1)), 1)
-        identify: Dict[str, Any] = {
-            "rpcVersion": self._rpc_version,
-            "eventSubscriptions": 0,
-        }
-        auth = data.get("authentication")
-        if auth:
-            if not password:
-                raise RuntimeError("OBS WebSocket 需要密码，请填写 capture.obs_websocket.password")
-            identify["authentication"] = self._build_auth(password, auth["salt"], auth["challenge"])
+            hello = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=5))
+            data = hello.get("d", {})
+            self._rpc_version = min(int(data.get("rpcVersion", 1)), 1)
+            identify: Dict[str, Any] = {
+                "rpcVersion": self._rpc_version,
+                "eventSubscriptions": 0,
+            }
+            auth = data.get("authentication")
+            if auth:
+                if not password:
+                    raise RuntimeError("OBS WebSocket 需要密码，请填写 capture.obs_websocket.password")
+                identify["authentication"] = self._build_auth(password, auth["salt"], auth["challenge"])
 
-        await self._ws.send(json.dumps({"op": 1, "d": identify}, ensure_ascii=False))
-        identified = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=5))
-        if identified.get("op") != 2:
-            raise RuntimeError(f"OBS WebSocket Identify 失败: {identified}")
+            await self._ws.send(json.dumps({"op": 1, "d": identify}, ensure_ascii=False))
+            identified = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=5))
+            if identified.get("op") != 2:
+                raise RuntimeError(f"OBS WebSocket Identify 失败: {identified}")
+        except Exception as exc:
+            await self.close()
+            self._url = None
+            self._password = ""
+            raise OBSConnectionError(
+                f"【OBS 未连接】无法连接 OBS WebSocket（{url}）：请确认 OBS 已打开，且“工具 > WebSocket 服务器设置”已开启；"
+                f"并检查地址、端口和密码是否正确。原始错误：{exc}"
+            ) from exc
 
         logging.info("OBS WebSocket 已连接: %s", url)
         return self._ws
@@ -1038,9 +1067,13 @@ class OBSWebSocketScreenshotClient:
                 msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
                 if msg.get("op") == 7 and msg.get("d", {}).get("requestId") == request_id:
                     return msg["d"]
-        except Exception:
-            await self.close()
+        except OBSConnectionError:
             raise
+        except Exception as exc:
+            await self.close()
+            raise OBSConnectionError(
+                f"【OBS 未连接】与 OBS 的连接已中断：请确认 OBS 仍在运行。原始错误：{exc}"
+            ) from exc
 
     def _decode_image_data(self, image_data: str) -> np.ndarray:
         raw = image_data.split(",", 1)[1] if "," in image_data else image_data
@@ -1060,23 +1093,106 @@ class OBSWebSocketScreenshotClient:
             return np.asarray(pil_image)[:, :, ::-1].copy()
 
 
+def _watch_parent_process(parent_pid: int) -> None:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.OpenProcess(0x00100000, False, parent_pid)
+        if not handle:
+            return
+
+        def wait_for_exit() -> None:
+            kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+            kernel32.CloseHandle(handle)
+            os._exit(0)
+
+        threading.Thread(target=wait_for_exit, name="OverlayParentWatch", daemon=True).start()
+    except Exception:
+        logging.debug("桌面透明层无法监视父进程", exc_info=True)
+
+
+def _setup_desktop_overlay_logging() -> None:
+    root = logging.getLogger()
+    if any(getattr(handler, "_obs_name_ocr_daily", False) for handler in root.handlers):
+        return
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    handler = DailyFileHandler(LOG_DIR)
+    handler._obs_name_ocr_daily = True
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [桌面层] %(message)s"))
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
+def _apply_desktop_overlay_dpi_awareness() -> None:
+    try:
+        import ctypes
+
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        logging.debug("设置桌面透明层 DPI 感知失败", exc_info=True)
+
+
+def _raise_desktop_overlay_priority() -> None:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x00008000)
+    except Exception:
+        logging.debug("提升桌面透明层进程优先级失败", exc_info=True)
+
+
+def _desktop_overlay_process_main(message_queue: Any, stop_event: Any, parent_pid: int) -> None:
+    _setup_desktop_overlay_logging()
+    _watch_parent_process(parent_pid)
+    _apply_desktop_overlay_dpi_awareness()
+    _raise_desktop_overlay_priority()
+    overlay = DesktopOverlay()
+    overlay._queue = message_queue
+    overlay._stop_event = stop_event
+    overlay._run()
+
+
 class DesktopOverlay:
     def __init__(self) -> None:
-        self._queue: queue.Queue = queue.Queue(maxsize=1)
-        self._thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
+        self._queue: Any = None
+        self._process: Optional[multiprocessing.Process] = None
+        self._stop_event: Any = None
         self._failed = False
-        self._enabled = False
 
     def update(self, message: Dict[str, Any], config: Dict[str, Any], region: Dict[str, int]) -> None:
         overlay_config = get_desktop_overlay_config(config)
         enabled = normalize_bool(overlay_config.get("enabled", False), False)
 
+        if self._process is not None and not self._process.is_alive():
+            logging.error(
+                "桌面透明层子进程已退出（exitcode=%s），已停用桌面透明层",
+                self._process.exitcode,
+            )
+            self._failed = True
+            self.stop()
+            return
+
         if not enabled or self._failed:
             self.stop()
             return
 
-        self._ensure_thread()
+        if not self._ensure_process():
+            return
+
         payload = {
             "message": message,
             "overlay": config.get("overlay", DEFAULT_CONFIG["overlay"]),
@@ -1088,36 +1204,61 @@ class DesktopOverlay:
                 "height": int(region["height"]),
             },
         }
-        self._replace_latest(payload)
-
-    def stop(self) -> None:
-        if self._thread is None:
-            return
-        self._stop_event.set()
-        self._replace_latest({"type": "stop"})
-        self._thread.join(timeout=0.3)
-        if self._thread.is_alive():
-            logging.warning("桌面透明层线程未及时退出，将随进程退出")
-        self._thread = None
-        self._stop_event.clear()
-
-    def _ensure_thread(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run, name="DesktopOverlay", daemon=True)
-        self._thread.start()
-
-    def _replace_latest(self, payload: Dict[str, Any]) -> None:
-        try:
-            while True:
-                self._queue.get_nowait()
-        except queue.Empty:
-            pass
         try:
             self._queue.put_nowait(payload)
-        except queue.Full:
-            pass
+        except Exception:
+            logging.exception("发送桌面透明层消息失败")
+
+    def stop(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        stop_event = self._stop_event
+        if stop_event is not None:
+            stop_event.set()
+        queue_obj = self._queue
+        if queue_obj is not None:
+            try:
+                queue_obj.put_nowait({"type": "stop"})
+            except Exception:
+                pass
+        process.join(timeout=1.0)
+        if process.is_alive():
+            logging.warning("桌面透明层子进程未及时退出，正在强制结束")
+            process.terminate()
+            process.join(timeout=0.5)
+        self._process = None
+        self._queue = None
+        self._stop_event = None
+        if queue_obj is not None:
+            try:
+                queue_obj.close()
+                queue_obj.join_thread()
+            except Exception:
+                pass
+
+    def _ensure_process(self) -> bool:
+        if self._process is not None and self._process.is_alive():
+            return True
+        try:
+            self._stop_event = multiprocessing.Event()
+            self._queue = multiprocessing.Queue()
+            self._process = multiprocessing.Process(
+                target=_desktop_overlay_process_main,
+                args=(self._queue, self._stop_event, os.getpid()),
+                name="DesktopOverlay",
+                daemon=True,
+            )
+            self._process.start()
+            logging.info("桌面透明层子进程已启动: pid=%s", self._process.pid)
+            return True
+        except Exception:
+            logging.exception("启动桌面透明层子进程失败，已停用桌面透明层")
+            self._failed = True
+            self._process = None
+            self._queue = None
+            self._stop_event = None
+            return False
 
     def _run(self) -> None:
         try:
@@ -1134,6 +1275,11 @@ class DesktopOverlay:
             "overlay": DEFAULT_CONFIG["overlay"],
             "desktop_overlay": DEFAULT_CONFIG["desktop_overlay"],
             "visible": False,
+            "window_key": None,
+            "drawn_bounds": [],
+            "anim_bounds": {},
+            "dirty_rects": None,
+            "full_repaint": True,
         }
 
         user32 = ctypes.windll.user32
@@ -1307,6 +1453,9 @@ class DesktopOverlay:
             wintypes.DWORD,
         ]
         gdi32.BitBlt.restype = wintypes.BOOL
+        gdi32.IntersectClipRect.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        gdi32.SelectClipRgn.argtypes = [wintypes.HDC, wintypes.HANDLE]
+        gdi32.SelectClipRgn.restype = ctypes.c_int
 
         def colorref(value: Any, fallback: str = "#ff3b30") -> int:
             text = str(value or fallback).strip()
@@ -1506,28 +1655,22 @@ class DesktopOverlay:
             region = state["region"]
             win_w = max(1, int(region["width"]))
             win_h = max(1, int(region["height"]))
-            msg_w = max(1.0, float(message.get("width", win_w)))
-            msg_h = max(1.0, float(message.get("height", win_h)))
-            scale_x = win_w / msg_w
-            scale_y = win_h / msg_h
-            margin = max(1, int(state["overlay"].get("line_width", 3))) * 2 + 2
-            label_bounds = state.get("anim_label_bounds", {})
+            bounds_map = state.get("anim_bounds", {})
             rects = []
             for index, box in enumerate(boxes):
                 if str(box.get("style") or "") not in ANIMATED_STYLES:
                     continue
-                left = int(float(box.get("x", 0)) * scale_x) - margin
-                top = int(float(box.get("y", 0)) * scale_y) - (28 + margin)
-                right = int(float(box.get("x", 0)) * scale_x + float(box.get("w", 0)) * scale_x) + margin
-                bottom = int(float(box.get("y", 0)) * scale_y + float(box.get("h", 0)) * scale_y) + margin
-                rect = RECT(max(0, left), max(0, top), min(win_w, right), min(win_h, bottom))
-                bounds = label_bounds.get(index)
-                if bounds is not None:
-                    rect.left = max(0, min(rect.left, bounds[0]))
-                    rect.top = max(0, min(rect.top, bounds[1]))
-                    rect.right = min(win_w, max(rect.right, bounds[2]))
-                    rect.bottom = min(win_h, max(rect.bottom, bounds[3]))
-                rects.append(rect)
+                bounds = bounds_map.get(index)
+                if bounds is None:
+                    continue
+                rects.append(
+                    RECT(
+                        max(0, bounds[0]),
+                        max(0, bounds[1]),
+                        min(win_w, bounds[2]),
+                        min(win_h, bounds[3]),
+                    )
+                )
             return rects
 
         SRCCOPY = 0x00CC0020
@@ -1564,6 +1707,89 @@ class DesktopOverlay:
             buffer_width = width_value
             buffer_height = height_value
 
+        def layout_box(
+            box: Dict[str, Any],
+            scale_x: float,
+            scale_y: float,
+            line_width: int,
+            show_label: bool,
+        ) -> Optional[Tuple[int, int, int, int, Any, Tuple[int, int, int, int]]]:
+            x = int(float(box.get("x", 0)) * scale_x)
+            y = int(float(box.get("y", 0)) * scale_y)
+            w = int(float(box.get("w", 0)) * scale_x)
+            h = int(float(box.get("h", 0)) * scale_y)
+            if w <= 0 or h <= 0:
+                return None
+            margin = line_width * 2 + 2
+            label_rect = None
+            left, top, right, bottom = x - margin, y - margin, x + w + margin, y + h + margin
+            if show_label:
+                label = str(box.get("label") or box.get("matched") or box.get("text") or "")
+                if label:
+                    measure_rect = RECT(0, 0, 0, 0)
+                    user32.DrawTextW(
+                        buffer_dc,
+                        label,
+                        len(label),
+                        ctypes.byref(measure_rect),
+                        DT_LEFT | DT_TOP | DT_SINGLELINE | DT_CALCRECT,
+                    )
+                    label_w = max(1, measure_rect.right - measure_rect.left) + 10
+                    label_h = max(1, measure_rect.bottom - measure_rect.top) + 4
+                    label_top = max(0, y - label_h)
+                    label_rect = RECT(x, label_top, x + label_w, label_top + label_h)
+                    left = min(left, label_rect.left)
+                    top = min(top, label_rect.top)
+                    right = max(right, label_rect.right)
+                    bottom = max(bottom, label_rect.bottom)
+            return (x, y, w, h, label_rect, (left, top, right, bottom))
+
+        def bounds_intersect(bounds: Tuple[int, int, int, int], region: Tuple[int, int, int, int]) -> bool:
+            return (
+                bounds[0] <= region[2]
+                and region[0] <= bounds[2]
+                and bounds[1] <= region[3]
+                and region[1] <= bounds[3]
+            )
+
+        def merge_bounds(rects: List[Tuple[int, int, int, int]]) -> List[Tuple[int, int, int, int]]:
+            pending = [rect for rect in rects if rect[0] < rect[2] and rect[1] < rect[3]]
+            changed = True
+            while changed and pending:
+                changed = False
+                merged: List[Tuple[int, int, int, int]] = []
+                for rect in pending:
+                    current = rect
+                    index = 0
+                    while index < len(merged):
+                        other = merged[index]
+                        if (
+                            current[0] - 4 <= other[2]
+                            and other[0] - 4 <= current[2]
+                            and current[1] - 4 <= other[3]
+                            and other[1] - 4 <= current[3]
+                        ):
+                            current = (
+                                min(current[0], other[0]),
+                                min(current[1], other[1]),
+                                max(current[2], other[2]),
+                                max(current[3], other[3]),
+                            )
+                            merged.pop(index)
+                            changed = True
+                        else:
+                            index += 1
+                    merged.append(current)
+                pending = merged
+            return pending
+
+        def invalidate(bounds_list: List[Tuple[int, int, int, int]]) -> None:
+            for left, top, right, bottom in bounds_list:
+                if left >= right or top >= bottom:
+                    continue
+                rect = RECT(left, top, right, bottom)
+                user32.InvalidateRect(hwnd, ctypes.byref(rect), False)
+
         def paint(hwnd: Any) -> int:
             ps = PAINTSTRUCT()
             hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
@@ -1575,142 +1801,155 @@ class DesktopOverlay:
                 target = buffer_dc
                 overlay_config = state["desktop_overlay"]
                 bg = colorref(overlay_config.get("transparent_color"), "#010101")
+
+                if state.get("full_repaint"):
+                    regions = [(0, 0, width, height)]
+                elif state.get("dirty_rects"):
+                    regions = [
+                        (int(left), int(top), int(right), int(bottom))
+                        for left, top, right, bottom in state["dirty_rects"]
+                    ]
+                else:
+                    regions = [(ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right, ps.rcPaint.bottom)]
+                regions = [
+                    (max(0, left), max(0, top), min(width, right), min(height, bottom))
+                    for left, top, right, bottom in regions
+                    if left < right and top < bottom
+                ]
+
+                message = state["message"]
+                msg_width = max(1, float(message.get("width", width)))
+                msg_height = max(1, float(message.get("height", height)))
+                scale_x = width / msg_width
+                scale_y = height / msg_height
+                overlay = state["overlay"]
+                default_color = colorref(overlay.get("stroke_color"), DEFAULT_CONFIG["overlay"]["stroke_color"])
+                line_width = max(1, int(overlay.get("line_width", DEFAULT_CONFIG["overlay"]["line_width"])))
+                show_label = normalize_bool(overlay.get("show_label", True), True)
+                debug_border = normalize_bool(overlay_config.get("debug_border", False), False)
+                boxes = get_boxes()
+                now = time.monotonic()
+
+                entries: List[Tuple[Dict[str, Any], Tuple[int, int, int, int, Any, Tuple[int, int, int, int]]]] = []
+                anim_bounds: Dict[int, Tuple[int, int, int, int]] = {}
+                for index, box in enumerate(boxes):
+                    layout = layout_box(box, scale_x, scale_y, line_width, show_label)
+                    if layout is None:
+                        continue
+                    if str(box.get("style") or "") in ANIMATED_STYLES:
+                        anim_bounds[index] = layout[5]
+                    entries.append((box, layout))
+                state["drawn_bounds"] = [layout[5] for _box, layout in entries]
+                state["anim_bounds"] = anim_bounds
+
                 bg_brush = gdi32.CreateSolidBrush(bg)
                 try:
-                    user32.FillRect(target, ctypes.byref(ps.rcPaint), bg_brush)
+                    for left, top, right, bottom in regions:
+                        rect = RECT(left, top, right, bottom)
+                        user32.FillRect(target, ctypes.byref(rect), bg_brush)
                 finally:
                     gdi32.DeleteObject(bg_brush)
 
-                boxes = get_boxes()
-                debug_border = normalize_bool(overlay_config.get("debug_border", False), False)
-                anim_label_bounds: Dict[int, Tuple[int, int, int, int]] = {}
-                if boxes or debug_border:
-                    message = state["message"]
-                    msg_width = max(1, float(message.get("width", width)))
-                    msg_height = max(1, float(message.get("height", height)))
-                    scale_x = width / msg_width
-                    scale_y = height / msg_height
-                    overlay = state["overlay"]
-                    default_color = colorref(overlay.get("stroke_color"), DEFAULT_CONFIG["overlay"]["stroke_color"])
-                    line_width = max(1, int(overlay.get("line_width", DEFAULT_CONFIG["overlay"]["line_width"])))
-                    show_label = normalize_bool(overlay.get("show_label", True), True)
-
-                    old_brush = gdi32.SelectObject(target, gdi32.GetStockObject(NULL_BRUSH))
-                    now = time.monotonic()
-                    try:
-                        if debug_border:
-                            old_pen = gdi32.SelectObject(target, get_pen(default_color, line_width))
-                            gdi32.Rectangle(target, 1, 1, width - 1, height - 1)
-                            gdi32.SelectObject(target, old_pen)
-                        for index, box in enumerate(boxes):
-                            x = int(float(box.get("x", 0)) * scale_x)
-                            y = int(float(box.get("y", 0)) * scale_y)
-                            w = int(float(box.get("w", 0)) * scale_x)
-                            h = int(float(box.get("h", 0)) * scale_y)
-                            if w <= 0 or h <= 0:
-                                continue
-                            box_style = str(box.get("style") or "")
-                            color = colorref(box.get("color"), overlay.get("stroke_color", DEFAULT_CONFIG["overlay"]["stroke_color"]))
-                            label_bg = color
-                            label_fg = colorref("#ffffff", "#ffffff")
-                            if box_style == "rainbow":
-                                draw_rainbow_border(target, x, y, w, h, line_width, now)
-                            elif box_style == "flash":
-                                flash_on = int(now * FLASH_HZ * 2) % 2 == 0
-                                label_bg = colorref("#ff3b30", "#ff3b30") if flash_on else colorref("#ffffff", "#ffffff")
-                                label_fg = colorref("#ffffff", "#ffffff") if flash_on else colorref("#000000", "#000000")
-                                box_pen = get_pen(label_bg, line_width)
-                                old_box_pen = gdi32.SelectObject(target, box_pen)
-                                gdi32.Rectangle(target, x, y, x + w, y + h)
-                                gdi32.SelectObject(target, old_box_pen)
-                            elif box_style == "pulse":
-                                label_bg = draw_pulse_border(target, x, y, w, h, color, line_width, now)
-                            elif box_style == "march":
-                                draw_march_border(target, x, y, w, h, line_width, now)
-                                label_bg = colorref(MARCH_COLORS[0])
-                                label_fg = colorref(MARCH_COLORS[1])
-                            elif box_style == "neon":
-                                draw_neon_border(target, x, y, w, h, color, line_width, now)
-                            elif box_style == "duotone":
-                                draw_duotone_border(target, x, y, w, h, line_width, now)
-                                label_bg = colorref(DUOTONE_COLORS[0])
-                            else:
-                                box_pen = get_pen(color, line_width)
-                                old_box_pen = gdi32.SelectObject(target, box_pen)
-                                gdi32.Rectangle(target, x, y, x + w, y + h)
-                                gdi32.SelectObject(target, old_box_pen)
-                            if show_label:
-                                label = str(
-                                    box.get("label") or box.get("matched") or box.get("text") or ""
-                                )
-                                if label:
-                                    measure_rect = RECT(0, 0, 0, 0)
-                                    user32.DrawTextW(
-                                        target,
-                                        label,
-                                        len(label),
-                                        ctypes.byref(measure_rect),
-                                        DT_LEFT | DT_TOP | DT_SINGLELINE | DT_CALCRECT,
+                old_brush = gdi32.SelectObject(target, gdi32.GetStockObject(NULL_BRUSH))
+                try:
+                    if debug_border:
+                        old_pen = gdi32.SelectObject(target, get_pen(default_color, line_width))
+                        gdi32.Rectangle(target, 1, 1, width - 1, height - 1)
+                        gdi32.SelectObject(target, old_pen)
+                    for left, top, right, bottom in regions:
+                        gdi32.IntersectClipRect(target, left, top, right, bottom)
+                        try:
+                            for box, layout in entries:
+                                x, y, w, h, label_rect, bounds = layout
+                                if not bounds_intersect(bounds, (left, top, right, bottom)):
+                                    continue
+                                box_style = str(box.get("style") or "")
+                                color = colorref(box.get("color"), overlay.get("stroke_color", DEFAULT_CONFIG["overlay"]["stroke_color"]))
+                                label_bg = color
+                                label_fg = colorref("#ffffff", "#ffffff")
+                                if box_style == "rainbow":
+                                    draw_rainbow_border(target, x, y, w, h, line_width, now)
+                                elif box_style == "flash":
+                                    flash_on = int(now * FLASH_HZ * 2) % 2 == 0
+                                    label_bg = colorref("#ff3b30", "#ff3b30") if flash_on else colorref("#ffffff", "#ffffff")
+                                    label_fg = colorref("#ffffff", "#ffffff") if flash_on else colorref("#000000", "#000000")
+                                    box_pen = get_pen(label_bg, line_width)
+                                    old_box_pen = gdi32.SelectObject(target, box_pen)
+                                    gdi32.Rectangle(target, x, y, x + w, y + h)
+                                    gdi32.SelectObject(target, old_box_pen)
+                                elif box_style == "pulse":
+                                    label_bg = draw_pulse_border(target, x, y, w, h, color, line_width, now)
+                                elif box_style == "march":
+                                    draw_march_border(target, x, y, w, h, line_width, now)
+                                    label_bg = colorref(MARCH_COLORS[0])
+                                    label_fg = colorref(MARCH_COLORS[1])
+                                elif box_style == "neon":
+                                    draw_neon_border(target, x, y, w, h, color, line_width, now)
+                                elif box_style == "duotone":
+                                    draw_duotone_border(target, x, y, w, h, line_width, now)
+                                    label_bg = colorref(DUOTONE_COLORS[0])
+                                else:
+                                    box_pen = get_pen(color, line_width)
+                                    old_box_pen = gdi32.SelectObject(target, box_pen)
+                                    gdi32.Rectangle(target, x, y, x + w, y + h)
+                                    gdi32.SelectObject(target, old_box_pen)
+                                if label_rect is not None:
+                                    label = str(
+                                        box.get("label") or box.get("matched") or box.get("text") or ""
                                     )
-                                    label_w = max(1, measure_rect.right - measure_rect.left) + 10
-                                    label_h = max(1, measure_rect.bottom - measure_rect.top) + 4
-                                    label_top = max(0, y - label_h)
-                                    label_rect = RECT(x, label_top, x + label_w, label_top + label_h)
-                                    if box_style == "rainbow":
-                                        draw_rainbow_label(target, label_rect, now)
-                                    else:
-                                        label_brush = gdi32.CreateSolidBrush(label_bg)
-                                        try:
-                                            user32.FillRect(target, ctypes.byref(label_rect), label_brush)
-                                        finally:
-                                            gdi32.DeleteObject(label_brush)
-                                    gdi32.SetBkMode(target, TRANSPARENT)
-                                    if box_style == "rainbow":
-                                        gdi32.SetTextColor(target, colorref("#000000", "#000000"))
-                                        for offset_x, offset_y in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)):
-                                            outline_rect = RECT(
-                                                label_rect.left + offset_x,
-                                                label_rect.top + offset_y,
-                                                label_rect.right + offset_x,
-                                                label_rect.bottom + offset_y,
-                                            )
-                                            user32.DrawTextW(
-                                                target,
-                                                label,
-                                                len(label),
-                                                ctypes.byref(outline_rect),
-                                                DT_LEFT | DT_TOP | DT_SINGLELINE,
-                                            )
-                                    gdi32.SetTextColor(target, label_fg)
-                                    user32.DrawTextW(
-                                        target,
-                                        label,
-                                        len(label),
-                                        ctypes.byref(label_rect),
-                                        DT_LEFT | DT_TOP | DT_SINGLELINE,
-                                    )
-                                    if box_style in ANIMATED_STYLES:
-                                        anim_label_bounds[index] = (
-                                            label_rect.left,
-                                            label_rect.top,
-                                            label_rect.right,
-                                            label_rect.bottom,
+                                    if label:
+                                        if box_style == "rainbow":
+                                            draw_rainbow_label(target, label_rect, now)
+                                        else:
+                                            label_brush = gdi32.CreateSolidBrush(label_bg)
+                                            try:
+                                                user32.FillRect(target, ctypes.byref(label_rect), label_brush)
+                                            finally:
+                                                gdi32.DeleteObject(label_brush)
+                                        gdi32.SetBkMode(target, TRANSPARENT)
+                                        if box_style == "rainbow":
+                                            gdi32.SetTextColor(target, colorref("#000000", "#000000"))
+                                            for offset_x, offset_y in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)):
+                                                outline_rect = RECT(
+                                                    label_rect.left + offset_x,
+                                                    label_rect.top + offset_y,
+                                                    label_rect.right + offset_x,
+                                                    label_rect.bottom + offset_y,
+                                                )
+                                                user32.DrawTextW(
+                                                    target,
+                                                    label,
+                                                    len(label),
+                                                    ctypes.byref(outline_rect),
+                                                    DT_LEFT | DT_TOP | DT_SINGLELINE,
+                                                )
+                                        gdi32.SetTextColor(target, label_fg)
+                                        user32.DrawTextW(
+                                            target,
+                                            label,
+                                            len(label),
+                                            ctypes.byref(label_rect),
+                                            DT_LEFT | DT_TOP | DT_SINGLELINE,
                                         )
-                    finally:
-                        gdi32.SelectObject(target, old_brush)
-                state["anim_label_bounds"] = anim_label_bounds
+                        finally:
+                            gdi32.SelectClipRgn(target, None)
+                finally:
+                    gdi32.SelectObject(target, old_brush)
 
-                gdi32.BitBlt(
-                    hdc,
-                    ps.rcPaint.left,
-                    ps.rcPaint.top,
-                    max(0, ps.rcPaint.right - ps.rcPaint.left),
-                    max(0, ps.rcPaint.bottom - ps.rcPaint.top),
-                    target,
-                    ps.rcPaint.left,
-                    ps.rcPaint.top,
-                    SRCCOPY,
-                )
+                for left, top, right, bottom in regions:
+                    gdi32.BitBlt(
+                        hdc,
+                        left,
+                        top,
+                        max(0, right - left),
+                        max(0, bottom - top),
+                        target,
+                        left,
+                        top,
+                        SRCCOPY,
+                    )
+                state["full_repaint"] = False
+                state["dirty_rects"] = None
             finally:
                 user32.EndPaint(hwnd, ctypes.byref(ps))
             return 0
@@ -1769,7 +2008,6 @@ class DesktopOverlay:
             height = max(1, int(region["height"]))
             overlay_config = state["desktop_overlay"]
             bg = colorref(overlay_config.get("transparent_color"), "#010101")
-            user32.SetLayeredWindowAttributes(hwnd, bg, 0, LWA_COLORKEY)
             topmost = normalize_bool(overlay_config.get("topmost", True), True)
             hide_when_empty = normalize_bool(
                 overlay_config.get("hide_when_empty", True),
@@ -1782,8 +2020,66 @@ class DesktopOverlay:
                     user32.ShowWindow(hwnd, SW_HIDE)
                     state["visible"] = False
                     logging.info("桌面透明层隐藏: 无命中框")
+                state["window_key"] = None
+                state["drawn_bounds"] = []
+                state["anim_bounds"] = {}
+                state["dirty_rects"] = None
+                state["full_repaint"] = True
                 return
 
+            overlay = state["overlay"]
+            line_width = max(1, int(overlay.get("line_width", DEFAULT_CONFIG["overlay"]["line_width"])))
+            show_label = normalize_bool(overlay.get("show_label", True), True)
+            window_key = (
+                int(region["left"]),
+                int(region["top"]),
+                width,
+                height,
+                bg,
+                topmost,
+                debug_border,
+                line_width,
+                show_label,
+            )
+            if state["visible"] and state.get("window_key") == window_key and state["drawn_bounds"]:
+                ensure_buffer(width, height)
+                user32.SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST if topmost else HWND_NOTOPMOST,
+                    int(region["left"]),
+                    int(region["top"]),
+                    width,
+                    height,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                )
+                user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+                message = state["message"]
+                scale_x = width / max(1.0, float(message.get("width", width)))
+                scale_y = height / max(1.0, float(message.get("height", height)))
+                new_bounds = []
+                for box in boxes:
+                    layout = layout_box(box, scale_x, scale_y, line_width, show_label)
+                    if layout is None:
+                        continue
+                    bounds = layout[5]
+                    if bounds[0] < bounds[2] and bounds[1] < bounds[3]:
+                        new_bounds.append(bounds)
+                dirty = merge_bounds(list(state["drawn_bounds"]) + new_bounds)
+                dirty = [
+                    (max(0, left), max(0, top), min(width, right), min(height, bottom))
+                    for left, top, right, bottom in dirty
+                ]
+                dirty = [rect for rect in dirty if rect[0] < rect[2] and rect[1] < rect[3]]
+                if dirty:
+                    state["dirty_rects"] = dirty
+                    invalidate(dirty)
+                now = time.monotonic()
+                if now - last_log_at >= 5.0:
+                    logging.info("桌面透明层更新: boxes=%s 变化区域=%s", len(boxes), len(dirty))
+                    last_log_at = now
+                return
+
+            user32.SetLayeredWindowAttributes(hwnd, bg, 0, LWA_COLORKEY)
             insert_after = HWND_TOPMOST if topmost else HWND_NOTOPMOST
             user32.SetWindowPos(
                 hwnd,
@@ -1796,6 +2092,9 @@ class DesktopOverlay:
             )
             user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
             state["visible"] = True
+            state["window_key"] = window_key
+            state["dirty_rects"] = None
+            state["full_repaint"] = True
             user32.InvalidateRect(hwnd, None, True)
             user32.UpdateWindow(hwnd)
             now = time.monotonic()
@@ -1839,8 +2138,11 @@ class DesktopOverlay:
                 if state["visible"] and now - last_anim_at >= ANIM_INTERVAL:
                     rects = get_animated_rects()
                     if rects:
-                        for rect in rects:
-                            user32.InvalidateRect(hwnd, ctypes.byref(rect), False)
+                        pending = list(state.get("dirty_rects") or [])
+                        pending.extend((rect.left, rect.top, rect.right, rect.bottom) for rect in rects)
+                        merged = merge_bounds(pending)
+                        state["dirty_rects"] = merged
+                        invalidate(merged)
                         last_anim_at = now
                 while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
                     user32.TranslateMessage(ctypes.byref(msg))
@@ -2778,6 +3080,33 @@ async def recognition_loop(server: OverlayServer, stop_event: asyncio.Event) -> 
     target_color_map = build_target_color_map(targets, config)
     last_reload_at = 0.0
     last_perf_log_at = 0.0
+    last_obs_problem = ""
+
+    def report_obs_problem(message: str) -> None:
+        nonlocal last_obs_problem
+        if message != last_obs_problem:
+            logging.error("%s", message)
+            last_obs_problem = message
+
+    async def clear_boxes() -> None:
+        nonlocal config
+        try:
+            config = load_config(write_if_missing=True)
+            capture = config.get("capture", {})
+            width = int(capture.get("width", DEFAULT_CONFIG["capture"]["width"]))
+            height = int(capture.get("height", DEFAULT_CONFIG["capture"]["height"]))
+            region = {
+                "left": int(capture.get("left", DEFAULT_CONFIG["capture"]["left"])),
+                "top": int(capture.get("top", DEFAULT_CONFIG["capture"]["top"])),
+                "width": width,
+                "height": height,
+            }
+            message = build_message(width, height, [], config)
+            await server.broadcast(message)
+            desktop_overlay.update(message, config, region)
+        except Exception:
+            logging.exception("发送空框失败")
+
     with mss.MSS() as sct:
         try:
             while not stop_event.is_set():
@@ -2795,6 +3124,9 @@ async def recognition_loop(server: OverlayServer, stop_event: asyncio.Event) -> 
                     boxes: List[Dict[str, Any]] = []
                     capture_started = time.monotonic()
                     frame = await capture_frame(sct, obs_client, config)
+                    if last_obs_problem:
+                        logging.info("OBS 连接与捕获画面已恢复正常")
+                        last_obs_problem = ""
                     capture_elapsed = time.monotonic() - capture_started
                     region, width, height = frame.region, frame.width, frame.height
 
@@ -2876,24 +3208,15 @@ async def recognition_loop(server: OverlayServer, stop_event: asyncio.Event) -> 
                             len(boxes),
                         )
                         last_perf_log_at = perf_now
+                except OBSConnectionError as exc:
+                    report_obs_problem(str(exc))
+                    await clear_boxes()
+                except OBSCaptureError as exc:
+                    report_obs_problem(str(exc))
+                    await clear_boxes()
                 except Exception:
                     logging.exception("识别循环失败，程序继续运行")
-                    try:
-                        config = load_config(write_if_missing=True)
-                        capture = config.get("capture", {})
-                        width = int(capture.get("width", DEFAULT_CONFIG["capture"]["width"]))
-                        height = int(capture.get("height", DEFAULT_CONFIG["capture"]["height"]))
-                        region = {
-                            "left": int(capture.get("left", DEFAULT_CONFIG["capture"]["left"])),
-                            "top": int(capture.get("top", DEFAULT_CONFIG["capture"]["top"])),
-                            "width": width,
-                            "height": height,
-                        }
-                        message = build_message(width, height, [], config)
-                        await server.broadcast(message)
-                        desktop_overlay.update(message, config, region)
-                    except Exception:
-                        logging.exception("发送空框失败")
+                    await clear_boxes()
 
                 elapsed = time.monotonic() - started
                 wait_seconds = max(0.0, interval - elapsed)
