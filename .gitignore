@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 *.pyd
 *.log
+*.tmp
 ocr_output.txt
 *.spec
 *.exe

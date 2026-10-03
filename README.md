@@ -6,11 +6,11 @@
 
 [![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078d6?logo=windows&logoColor=white)](#)
-[![GUI](https://img.shields.io/badge/GUI-v15-6b7280)](#)
+[![GUI](https://img.shields.io/badge/GUI-v16-6b7280)](#)
 
 </div>
 
-当前 GUI 版本：`v15`。版本号集中定义在 `gui.py` 顶部的 `APP_VERSION`，修改该常量即可更新窗口标题和工具栏显示。
+当前 GUI 版本：`v16`。版本号集中定义在 `gui.py` 顶部的 `APP_VERSION`，修改该常量即可更新窗口标题和工具栏显示。
 
 worker 会读取当前目录的 `name.txt`，按 `config.json` 配置截图并 OCR。命中目标文字后，会通过 WebSocket 推送给 `overlay.html`，也可以按配置开启 Windows 桌面透明覆盖层。
 
@@ -65,7 +65,8 @@ python .\worker.py
 | 文件 | 说明 |
 | --- | --- |
 | `worker.py` | OCR worker，负责截图、识别、匹配、HTTP/WebSocket 服务和可选桌面透明覆盖层 |
-| `gui.py` | 本地桌面 UI，用于编辑 `name.txt`、修改 `config.json`、启动/停止 worker、测试 OBS WebSocket 和查看最近日志 |
+| `gui.py` | 本地桌面 UI，用于可视化编辑 `name.txt`、修改 `config.json`、启动/停止 worker、测试 OBS WebSocket 和查看最近日志 |
+| `name_store.py` | `name.txt` 的解析 / 校验 / 原子写回逻辑（纯 Python，不依赖 PySide6），GUI 与 worker 共用同一套文件语义 |
 | `overlay.html` | OBS 浏览器源使用的透明 canvas 画框页面 |
 | `config.json` | 运行配置（不存在时自动创建） |
 | `name.txt` | 目标文字列表，每行一个目标 |
@@ -248,7 +249,26 @@ TensorRT 常见问题和本次实际踩坑：
 .\venv\Scripts\python.exe .\gui.py
 ```
 
-桌面 UI 不需要浏览器页面板。它可以直接编辑 `name.txt`，用中文表单修改 `config.json`，启动或停止 `worker.py`，测试 OBS WebSocket 连接，获取 OBS 场景和输入源并回填 `source_name` / `source_uuid`，底部会自动刷新运行目录 `logs/YYYYMMDD.log` 的最近 5 行。`name.txt` 面板还提供「特效说明」按钮，弹出各分组特效后缀的速查表。
+桌面 UI 不需要浏览器页面板。主窗口把整页都留给目标列表和日志：上半部分是 `name.txt` 的可视化编辑器（分组 + 名单），下半部分是最近日志，中间的分隔条可以拖动调整两者高度。`config.json` 收进了工具栏的「配置 config.json」按钮，点开才是配置窗口——配置调试好之后一般不用再改。窗口里还能启动或停止 `worker.py`、测试 OBS WebSocket 连接、获取 OBS 场景和输入源并回填 `source_name` / `source_uuid`。`name.txt` 面板还提供「特效说明」按钮，弹出各分组特效后缀的速查表。
+
+`name.txt` 面板的用法：
+
+| 位置 | 作用 |
+| --- | --- |
+| 搜索框 | 按关键字过滤目标（不区分大小写），命中的分组会整组显示 |
+| 分组目录 | 左侧窄栏只列分组（带目标数和特效色块），点一下列表就跳到该分组；搜索时目录会一起过滤 |
+| 分组 / 目标列 | 树形展示；双击分组名或目标名可直接改名（“（未分组）”不能改名，可把它里面的目标移到别的分组） |
+| 特效列 | 每个分组一个下拉框：默认自动分色、彩虹流光、红白闪烁、呼吸脉冲、黄黑警戒、霓虹光晕、双色渐变；“（未分组）”那一行没有表头，下拉框会被禁用 |
+| 备注列 | 分组显示目标数量（空分组会标注），重复目标显示 `⚠ 重复`；这一列不可编辑 |
+| 效果预览 | 选中分组后按该特效实时预览边框和标签（近似效果） |
+| ＋分组 / ＋目标 | 新建分组；向选中分组批量添加目标（一次可粘贴多行） |
+| 改名 / 删除 / 上移 / 下移 | 重命名、删除、调整分组或目标的顺序 |
+| 移动到… | 把选中的目标移动到别的分组，每个分组都有「移到顶部」和「移到最后」两项 |
+| 查重 | 列出重复目标并一键删除后出现的重复项 |
+| 源码 | 以纯文本查看 / 编辑 `name.txt`，应用后回到可视化列表 |
+| 保存 / 重载 | 原子写回 `name.txt`（写入期间 worker 不会读到半截文件）；保存后 worker 会在下一次热重载自动应用 |
+
+面板标题旁的汇总会显示分组数、目标数和重复条数；有未保存修改时会显示 `● 未保存`。配置项在工具栏的「配置 config.json」弹窗里。
 
 worker、GUI 启动的子进程输出以及 OBS 脚本启动的 worker 输出统一写入运行目录的 `logs` 文件夹，并按本地日期生成文件，例如 `logs/20260806.log`。
 
@@ -281,6 +301,7 @@ taskkill /PID 进程号 /F
 - 每行一个目标。
 - 空行会被忽略。
 - `#` 开头的行是分组标签；目标使用它上方最近的分组。
+- 不属于任何分组的目标有两种写法：放在文件第一个分组标签之前，或者放在一行裸 `#` 之后（GUI 里显示为“（未分组）”）。
 - 有分组时，识别框标签显示为 `分组：目标 - 百分比`；没有分组时显示 `目标 - 百分比`。
 - 百分比是“识别到该 ID 的可信度”：由 OCR 识别置信度和匹配证据（原始/归一化/编辑距离/相似度档位、目标覆盖率）加权融合后取整，最高封顶 `99%`，与 `match.min_confidence` 不是同一个数值。
 - worker 会运行中反复读取，改完文件后不需要重启。
@@ -298,7 +319,7 @@ taskkill /PID 进程号 /F
 | `#N` | neon 霓虹光晕 | 保留自动分色，边框外圈同色柔光按 1.6 秒周期呼吸 |
 | `#D` | duotone 双色渐变 | 青色 `#00c7be` 与紫色 `#af52de` 沿边框循环流动 |
 
-GUI 里 `name.txt` 面板的「特效说明」按钮可以随时查看这张表。
+GUI 里 `name.txt` 面板的每个分组右侧下拉框可以直接选这些特效（不用手写后缀），「特效说明」按钮可以随时查看这张表。
 
 示例：
 

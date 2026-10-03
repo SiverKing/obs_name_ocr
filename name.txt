@@ -1,12 +1,5 @@
-# 彩虹流光#R
-# 红白闪烁#F
-# 呼吸脉冲#P
-# 黄黑警戒#M
-# 霓虹光晕#N
-# 双色渐变#D
 # 管理员#R
 Siver-King
-7Azzz
 AWM
 2vss
 ninoOoO-_
@@ -38,6 +31,8 @@ GD---_---GD
 1-Coke-
 e1add
 bieyangbieya
+Xiao772
+7Azzzzz
 
 # 改邪归正#F
 asdopjkkf
@@ -49,7 +44,7 @@ DSVERG
 Swallowed_Star_
 Swallowed_St
 
-# 2人头不死已禁赛过1#P
+# 2人头不死已禁赛过1
 c61m8kt7ny
 
 # 黑名单#M
@@ -91,9 +86,6 @@ Ogilian0
 # 故意踹人给机会#M
 06-China-NB-
 Slayer_Maom
-
-# 脚贱
-m24nbl
 
 # 重机堵楼梯#M
 Xue_Yao
@@ -145,7 +137,6 @@ dfhaswfh
 khjbgcv
 whaxfgh
 kjaghsw
-dfbfmxv
 gnjsdvs
 kjzsdghf
 jhsfqw
